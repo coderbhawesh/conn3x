@@ -101,18 +101,15 @@ func loadConfigFileBody(body hcl.Body, _ string, override bool) (*File, hcl.Diag
 	content, contentDiags := body.Content(configFileSchema)
 	diags = append(diags, contentDiags...)
 
+	circuits := map[string]hcl.Range{} // CONN3X: circuit names seen in this file
 	for _, block := range content.Blocks {
 		switch block.Type {
 
 		// CONN3X: circuits are lowered to conn3x resources (see conn3x_circuit.go).
-		// The module checks their names across files.
 		case "circuit":
-			circuit, circuitDiags := decodeCircuit(block)
+			resources, circuitDiags := decodeCircuitBlock(block, circuits)
 			diags = append(diags, circuitDiags...)
-			if circuit != nil {
-				file.Circuits = append(file.Circuits, circuit)
-				file.ManagedResources = append(file.ManagedResources, circuit.Resources...)
-			}
+			file.ManagedResources = append(file.ManagedResources, resources...)
 
 		case "language":
 			cfgDiags := validateLanguageBlock(block, override)

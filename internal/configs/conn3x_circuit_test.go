@@ -362,11 +362,11 @@ func TestDuplicateCircuitAcrossFiles(t *testing.T) {
 			if d.Summary != "Duplicate circuit" {
 				t.Fatalf("summary %q, want Duplicate circuit", d.Summary)
 			}
-			if !strings.Contains(d.Detail, "already declared at mod/"+tc.first) {
+			if !strings.Contains(d.Detail, "already declared in mod/"+tc.first) {
 				t.Fatalf("detail %q does not name %s", d.Detail, tc.first)
 			}
-			if d.Subject == nil || d.Subject.Filename != "mod/"+tc.second {
-				t.Fatalf("subject %v should be in %s", d.Subject, tc.second)
+			if d.Subject == nil || d.Subject.Filename != "mod/"+tc.second || d.Subject.Start.Line != 6 {
+				t.Fatalf("subject %v should be the step in %s", d.Subject, tc.second)
 			}
 		})
 	}
@@ -866,7 +866,7 @@ func TestLoopingStepLowersTwice(t *testing.T) {
 	content, _ := file.Body.Content(&hcl.BodySchema{Blocks: []hcl.BlockHeaderSchema{{Type: "circuit", LabelNames: []string{"name"}}}})
 	var second []*Resource
 	for range 2 {
-		rs, d := decodeCircuitBlock(content.Blocks[0])
+		rs, d := decodeCircuitBlock(content.Blocks[0], map[string]hcl.Range{})
 		if d.HasErrors() {
 			t.Fatal(d.Error())
 		}

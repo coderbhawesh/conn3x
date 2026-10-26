@@ -52,8 +52,6 @@ type Module struct {
 	DataResources      map[string]*Resource
 	EphemeralResources map[string]*Resource
 
-	Circuits map[string]*Circuit // CONN3X: circuits by name, for the duplicate check
-
 	Moved   []*Moved
 	Import  []*Import
 	Removed []*Removed
@@ -113,8 +111,6 @@ type File struct {
 	ManagedResources   []*Resource
 	DataResources      []*Resource
 	EphemeralResources []*Resource
-
-	Circuits []*Circuit // CONN3X: circuits declared in this file
 
 	Moved   []*Moved
 	Import  []*Import
@@ -505,14 +501,7 @@ func (m *Module) appendFile(file *File) hcl.Diagnostics {
 		m.SymbolCalls[mc.Name] = mc
 	}
 
-	// CONN3X: catch a circuit name declared twice, in one file or across files.
-	skipResources, circuitDiags := m.appendCircuits(file)
-	diags = append(diags, circuitDiags...)
-
 	for _, r := range file.ManagedResources {
-		if skipResources[r] { // CONN3X: a duplicate circuit's resources are left out
-			continue
-		}
 		key := r.moduleUniqueKey()
 		if existing, exists := m.ManagedResources[key]; exists {
 			diags = append(diags, &hcl.Diagnostic{
