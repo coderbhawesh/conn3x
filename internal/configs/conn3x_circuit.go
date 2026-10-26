@@ -98,9 +98,55 @@ func circuitFileExtOf(path string) string {
 	return ""
 }
 
-// decodeCircuitBlock lowers one circuit block to managed resources. seen
-// tracks circuit names already declared in the same file.
-func decodeCircuitBlock(block *hcl.Block, seen map[string]hcl.Range) ([]*Resource, hcl.Diagnostics) {
+// Circuit is a circuit block and the resources it lowered to. Files keep
+// their circuits so the module can catch one name declared in two files.
+type Circuit struct {
+	Name      string
+	DeclRange hcl.Range
+	Resources []*Resource
+}
+
+// decodeCircuit lowers a circuit block and records it for the module.
+// It returns nil for a circuit whose name is invalid.
+func decodeCircuit(block *hcl.Block) (*Circuit, hcl.Diagnostics) {
+	resources, diags := decodeCircuitBlock(block)
+	if !validCircuitName(block.Labels[0]) {
+		return nil, diags
+	}
+	return &Circuit{Name: block.Labels[0], DeclRange: block.DefRange, Resources: resources}, diags
+}
+
+// appendCircuits adds a file's circuits to the module. A circuit whose
+// name is already taken, in this file or an earlier one, is an error, and
+// its resources are returned so the module leaves them out instead of
+// also reporting them as duplicate resources.
+func (m *Module) appendCircuits(file *File) (map[*Resource]bool, hcl.Diagnostics) {
+	var diags hcl.Diagnostics
+	if m.Circuits == nil {
+		m.Circuits = map[string]*Circuit{}
+	}
+	skip := map[*Resource]bool{}
+	for _, c := range file.Circuits {
+		if existing, dup := m.Circuits[c.Name]; dup {
+			rng := c.DeclRange
+			diags = append(diags, &hcl.Diagnostic{
+				Severity: hcl.DiagError,
+				Summary:  "Duplicate circuit",
+				Detail:   fmt.Sprintf("A circuit named %q was already declared at %s. Circuit names must be unique within a module.", c.Name, existing.DeclRange),
+				Subject:  &rng,
+			})
+			for _, r := range c.Resources {
+				skip[r] = true
+			}
+			continue
+		}
+		m.Circuits[c.Name] = c
+	}
+	return skip, diags
+}
+
+// decodeCircuitBlock lowers one circuit block to managed resources.
+func decodeCircuitBlock(block *hcl.Block) ([]*Resource, hcl.Diagnostics) {
 	var diags hcl.Diagnostics
 	name := block.Labels[0]
 	if !validCircuitName(name) {
@@ -112,16 +158,6 @@ func decodeCircuitBlock(block *hcl.Block, seen map[string]hcl.Range) ([]*Resourc
 		})
 		return nil, diags
 	}
-	if prev, dup := seen[name]; dup {
-		diags = append(diags, &hcl.Diagnostic{
-			Severity: hcl.DiagError,
-			Summary:  "Duplicate circuit",
-			Detail:   fmt.Sprintf("A circuit named %q was already declared at %s. Circuit names must be unique within a module.", name, prev),
-			Subject:  &block.DefRange,
-		})
-		return nil, diags
-	}
-	seen[name] = block.DefRange
 
 	content, moreDiags := block.Body.Content(circuitSchema)
 	diags = append(diags, moreDiags...)
