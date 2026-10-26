@@ -198,6 +198,48 @@ func TestCircuitErrors(t *testing.T) {
     }
   }
 }`, "exactly one module"},
+		"two different modules": {`circuit "a" {
+  hosts = { h = "1.2.3.4" }
+  ssh {
+    user = "root"
+  }
+  step "s" {
+    package {
+      name = "nginx"
+    }
+    service {
+      name = "nginx"
+    }
+  }
+}`, "exactly one module"},
+		"lifecycle block": {`circuit "a" {
+  hosts = { h = "1.2.3.4" }
+  ssh {
+    user = "root"
+  }
+  step "s" {
+    package {
+      name = "nginx"
+    }
+    lifecycle {
+      prevent_destroy = true
+    }
+  }
+}`, `one module block, not "lifecycle"`},
+		"unknown block": {`circuit "a" {
+  hosts = { h = "1.2.3.4" }
+  ssh {
+    user = "root"
+  }
+  step "s" {
+    package {
+      name = "nginx"
+    }
+    retries {
+      count = 3
+    }
+  }
+}`, `one module block, not "retries"`},
 		"duplicate step": {`circuit "a" {
   hosts = { h = "1.2.3.4" }
   ssh {
@@ -262,6 +304,29 @@ circuit "a" {
 				t.Fatalf("error %q does not mention %q", diags.Error(), tc.want)
 			}
 		})
+	}
+}
+
+func TestUnsupportedStepBlockPointsAtItsType(t *testing.T) {
+	_, diags := loadCircuitModule(t, map[string]string{"main.circuit.hcl": `circuit "a" {
+  hosts = { h = "1.2.3.4" }
+  ssh {
+    user = "root"
+  }
+  step "s" {
+    package {
+      name = "nginx"
+    }
+    lifecycle {
+      prevent_destroy = true
+    }
+  }
+}`})
+	if len(diags) != 1 {
+		t.Fatalf("want one diagnostic, got %d: %s", len(diags), diags.Error())
+	}
+	if rng := diags[0].Subject; rng == nil || rng.Start.Line != 10 || rng.Start.Column != 5 || rng.End.Column != 14 {
+		t.Fatalf("subject %v should cover the lifecycle keyword", rng)
 	}
 }
 

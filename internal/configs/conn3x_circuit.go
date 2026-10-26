@@ -289,6 +289,25 @@ func lowerStep(circuit string, step *hcl.Block, hosts hcl.Expression, sshAttrs h
 			})
 		}
 	}
+	if len(body.Blocks) > 1 {
+		unsupported := false
+		for _, block := range body.Blocks {
+			if _, ok := circuitModules[block.Type]; ok || block.Type == "template" {
+				continue
+			}
+			unsupported = true
+			rng := block.TypeRange
+			diags = append(diags, &hcl.Diagnostic{
+				Severity: hcl.DiagError,
+				Summary:  "Unsupported block in step",
+				Detail:   fmt.Sprintf("A step takes only for_each, depends_on, notify and one module block, not %q.", block.Type),
+				Subject:  &rng,
+			})
+		}
+		if unsupported {
+			return nil, diags
+		}
+	}
 	if len(body.Blocks) != 1 {
 		rng := step.DefRange
 		return nil, append(diags, &hcl.Diagnostic{
