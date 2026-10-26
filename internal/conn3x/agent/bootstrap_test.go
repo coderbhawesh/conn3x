@@ -12,6 +12,7 @@ import (
 	"io/fs"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -73,14 +74,17 @@ func newTestHost(t *testing.T) *testHost {
 	return &testHost{Server: s, home: home}
 }
 
-// fakeCommand puts a script called name first on the host's PATH.
+// fakeCommand puts a script called name first on the PATH the bootstrap
+// scripts set.
 func (h *testHost) fakeCommand(t *testing.T, name, script string) {
 	t.Helper()
 	bin := t.TempDir()
 	if err := os.WriteFile(filepath.Join(bin, name), []byte("#!/bin/sh\n"+script+"\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	h.Env = append(h.Env, "PATH="+bin+":"+os.Getenv("PATH"))
+	old := hostPath
+	hostPath = bin + ":" + hostPath
+	t.Cleanup(func() { hostPath = old })
 }
 
 func (h *testHost) cacheDir() string { return filepath.Join(h.home, ".cache", "conn3x") }
@@ -161,13 +165,14 @@ func TestAttachUploadsThenReusesCache(t *testing.T) {
 		t.Fatalf("agent said %q", got)
 	}
 	before := len(h.Commands())
-	// Commands run where a shell command would, not in the cache.
-	shell, err := dialServer(t, h.Server).Run(ctx, "pwd", nil)
+	// Commands run where a shell command would, not in the cache, and
+	// with the same umask, not the bootstrap's.
+	shell, err := dialServer(t, h.Server).Run(ctx, "pwd; umask", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := mustRun(t, a, "pwd"); got != string(shell.Stdout) {
-		t.Fatalf("agent runs commands in %q, the shell in %q", got, shell.Stdout)
+	if got := mustRun(t, a, "pwd; umask"); got != string(shell.Stdout) {
+		t.Fatalf("agent runs commands with %q, the shell with %q", got, shell.Stdout)
 	}
 	if got := h.Commands()[:before]; len(got) != 3 {
 		t.Fatalf("first attach ran %d commands, want probe, upload and start:\n%s", len(got), strings.Join(got, "\n---\n"))
@@ -318,6 +323,21 @@ func TestAttachSkipsUnusableDir(t *testing.T) {
 				}
 			})
 		},
+		// Others could swap the directory itself, so its being private
+		// proves nothing.
+		"inside a directory open to others": func(t *testing.T, dir string) {
+			if err := os.Mkdir(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(filepath.Dir(dir), 0o777); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if got := names(t, dir); len(got) != 0 {
+					t.Errorf("the directory got %q", got)
+				}
+			})
+		},
 		"a file": func(t *testing.T, dir string) {
 			if err := os.WriteFile(dir, nil, 0o600); err != nil {
 				t.Fatal(err)
@@ -459,10 +479,82 @@ func TestStartRefusesReplacedBinary(t *testing.T) {
 	}
 	raw, _ := testAgent()
 	sum := sha256.Sum256(raw)
-	if _, err := start(ctx, dialServer(t, h.Server), h.cacheDir(), agentName(t), hex.EncodeToString(sum[:])); err == nil {
+	if _, err := start(ctx, dialServer(t, h.Server), h.cacheDir(), agentName(t), hex.EncodeToString(sum[:]), nil); err == nil {
 		t.Fatal("started a replaced binary")
 	}
 	if _, err := os.Stat(mark); err == nil {
 		t.Fatal("the replaced binary was run")
+	}
+}
+
+// A command the login user put earlier on PATH is never what the scripts
+// run: under become they run as root.
+func TestScriptsIgnoreCommandsOnPath(t *testing.T) {
+	h := newTestHost(t)
+	mark := filepath.Join(t.TempDir(), "ran")
+	bin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bin, "sha256sum"), []byte("#!/bin/sh\ntouch "+mark+"\necho bogus\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	h.Env = append(h.Env, "PATH="+bin+":"+os.Getenv("PATH"))
+	a, err := h.attach(t, Options{Upload: true, Version: testVersion, Payload: agentPayload(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustRun(t, a, "true")
+	if _, err := os.Stat(mark); err == nil {
+		t.Fatal("the scripts ran the sha256sum from the login user's PATH")
+	}
+}
+
+// The group-writable exception holds only for a per-user primary group,
+// where the group is the user and nobody else.
+func TestGuardedGroupWritable(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root never gets the exception")
+	}
+	u, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := user.LookupGroupId(u.Gid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	if err := os.Chown(dir, -1, os.Getgid()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o770); err != nil {
+		t.Fatal(err)
+	}
+	err = exec.Command("/bin/sh", "-c", helpers+`guarded "$1"`, "sh", dir).Run()
+	if perUser := g.Name == u.Username; (err == nil) != perUser {
+		t.Fatalf("guarded on a directory writable by group %s (user %s) = %v, want accepted only for a per-user group", g.Name, u.Username, err)
+	}
+}
+
+// Root ignores XDG_CACHE_HOME, which sudo may keep from the login user and
+// which can point into their home even when HOME is root's.
+func TestRootIgnoresXDGCacheHome(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root")
+	}
+	h := newTestHost(t)
+	other := t.TempDir()
+	if err := os.Chown(other, 65534, 65534); err != nil {
+		t.Fatal(err)
+	}
+	h.Env = append(h.Env, "XDG_CACHE_HOME="+filepath.Join(other, ".cache"))
+	a, err := h.attach(t, Options{Upload: true, Version: testVersion, Payload: agentPayload(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustRun(t, a, "true")
+	if got := names(t, other); len(got) != 0 {
+		t.Fatalf("root wrote %q into another user's directory", got)
+	}
+	if got := names(t, h.cacheDir()); !slices.Equal(got, []string{agentName(t)}) {
+		t.Fatalf("root's own cache holds %q, want the agent", got)
 	}
 }

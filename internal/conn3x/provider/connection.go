@@ -7,9 +7,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"math/big"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -54,7 +56,7 @@ func connectionBlock() *configschema.NestedBlock {
 				"ssh_config_file": {
 					Type:        cty.String,
 					Optional:    true,
-					Description: "An OpenSSH config file, such as ~/.ssh/config, to read HostName, User, Port, IdentityFile, ProxyJump and UserKnownHostsFile from, with host as the Host alias. Anything set in this block wins. Nothing is read unless this is set.",
+					Description: "An OpenSSH config file, such as ~/.ssh/config, to read HostName, User, Port, IdentityFile, ProxyJump and UserKnownHostsFile from, with host as the Host alias. Each ProxyJump hop is looked up the same way. Anything set in this block wins. Nothing is read unless this is set.",
 				},
 				"private_key_file": {Type: cty.String, Optional: true, Description: "Path to a private key. Defaults to the SSH agent."},
 				"host_key":         {Type: cty.String, Optional: true, Description: "Pinned host public key, in authorized_keys format."},
@@ -63,7 +65,7 @@ func connectionBlock() *configschema.NestedBlock {
 				"agent": {
 					Type:        cty.Bool,
 					Optional:    true,
-					Description: "Run commands through the conn3x agent: a small program conn3x copies to the host and keeps running for the whole run, so each command costs one round trip instead of a new SSH session. An apply uploads it to ~/.cache/conn3x, checked by sha256; a plan only uses a copy already there. Hosts that can't run it fall back to plain shell commands. Not yet used with become. Overrides the CONN3X_AGENT environment variable: on, off, or require, which fails an apply rather than fall back to the shell. Defaults to off.",
+					Description: "Run commands through the conn3x agent: a small program conn3x copies to the host and keeps running for the whole run, so each command costs one round trip instead of a new SSH session. An apply uploads it to ~/.cache/conn3x, checked by sha256; a plan only uses a copy already there. Hosts that can't run it fall back to plain shell commands. With become it runs as root, one agent per host and login user, cached in root's own directory. Overrides the CONN3X_AGENT environment variable: on, off, or require, which fails an apply rather than fall back to the shell. Defaults to off.",
 				},
 				"timeout": {
 					Type:        cty.String,
@@ -87,8 +89,10 @@ type hostConn struct {
 	client   *ssh.Client
 	runner   modules.Runner
 	useAgent bool
-	require  bool // CONN3X_AGENT=require: an apply fails rather than use the shell
-	host     string // for log messages
+	require  bool        // CONN3X_AGENT=require: an apply fails rather than use the shell
+	host     string      // for log messages
+	become   *ssh.Become // set when commands run as root
+	rootKey  string      // names the host in rootAgents
 
 	mu        sync.Mutex
 	agent     *agent.Client
@@ -129,10 +133,19 @@ func (h *hostConn) attach(ctx context.Context, upload bool) error {
 		return h.attachErr
 	}
 	h.tried[i] = true
-	a, err := agent.Attach(ctx, h.client, agent.Options{Upload: upload, Version: version.Version, Payload: agentPayload})
+	var a *agent.Client
+	var err error
+	if h.become != nil {
+		a, err = h.attachRoot(ctx, upload)
+	} else {
+		a, err = agent.Attach(ctx, h.client, agent.Options{Upload: upload, Version: version.Version, Payload: agentPayload})
+	}
 	switch {
 	case err == nil:
 		h.agent = a
+	case errors.Is(err, ssh.ErrBecome):
+		h.attachErr = err // sudo refused; the shell would fail the same way
+		return err
 	case upload && h.require:
 		h.attachErr = fmt.Errorf("CONN3X_AGENT=require, but the conn3x agent can't run on %s: %w", h.host, err)
 		return h.attachErr
@@ -142,6 +155,42 @@ func (h *hostConn) attach(ctx context.Context, upload bool) error {
 		log.Printf("[INFO] conn3x: running shell commands on %s until an apply: %v", h.host, err)
 	}
 	return nil
+}
+
+// rootAgents holds the one root agent each host runs for each login user.
+var rootAgents = struct {
+	sync.Mutex
+	m map[string]*rootAgent
+}{m: map[string]*rootAgent{}}
+
+type rootAgent struct {
+	mu sync.Mutex
+	a  *agent.Client
+}
+
+// attachRoot returns the root agent already running for this host and
+// login user, or starts one. Logins as other users never share it: sudo can
+// give each user its own rules (NOEXEC, an SELinux role, logging), and a
+// command run as root must carry the rules and the name of whoever ran it.
+func (h *hostConn) attachRoot(ctx context.Context, upload bool) (*agent.Client, error) {
+	rootAgents.Lock()
+	r := rootAgents.m[h.rootKey]
+	if r == nil {
+		r = &rootAgent{}
+		rootAgents.m[h.rootKey] = r
+	}
+	rootAgents.Unlock()
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.a != nil && r.a.Err() == nil {
+		return r.a, nil
+	}
+	a, err := agent.Attach(ctx, h.client, agent.Options{Upload: upload, Version: version.Version, Payload: agentPayload, Become: h.become})
+	if err == nil {
+		r.a = a
+	}
+	return a, err
 }
 
 // alive reports whether the connection, and its agent if it has one,
@@ -237,9 +286,7 @@ func pooled(ctx context.Context, conn cty.Value) (*hostConn, error) {
 		}
 		password = []byte(strings.TrimRight(string(raw), "\r\n"))
 	}
-	// Under sudo the shell stays in charge until the agent can become root.
 	useAgent, require := wantAgent(conn)
-	useAgent = useAgent && !useSudo
 	key := poolKey(cfg, useSudo, password, useAgent, require)
 
 	pool.Lock()
@@ -283,9 +330,10 @@ func pooled(ctx context.Context, conn cty.Value) (*hostConn, error) {
 		close(entry.ready)
 		return nil, err
 	}
-	h := &hostConn{client: client, runner: client, useAgent: useAgent, require: require, host: cfg.Host}
+	h := &hostConn{client: client, runner: client, useAgent: useAgent, require: require, host: cfg.Host, rootKey: rootKey(cfg)}
 	if useSudo {
-		h.runner = &ssh.Become{Client: client, Password: password}
+		h.become = &ssh.Become{Client: client, Password: password}
+		h.runner = h.become
 	}
 	entry.conn = h
 	close(entry.ready)
@@ -304,6 +352,17 @@ func poolKey(cfg ssh.Config, become bool, password []byte, useAgent, require boo
 		sum.Write([]byte{0})
 	}
 	return hex.EncodeToString(sum.Sum(nil))
+}
+
+// rootKey names the machine an ssh block reaches and the user it logs in
+// as: the address, the bastions on the way, how its host key is checked
+// and the user, but not the key or the password.
+func rootKey(cfg ssh.Config) string {
+	jumps := make([]ssh.Jump, len(cfg.Jumps))
+	for i, j := range cfg.Jumps {
+		jumps[i] = ssh.Jump{Host: j.Host, Port: j.Port, User: j.User}
+	}
+	return poolKey(ssh.Config{Host: cfg.Host, Port: cfg.Port, User: cfg.User, Jumps: jumps, HostKey: cfg.HostKey, KnownHostsFile: cfg.KnownHostsFile}, true, nil, true, false)
 }
 
 // optional reads an attribute added after v0.1, which older values lack.
@@ -373,7 +432,9 @@ func sshConfig(conn cty.Value) (ssh.Config, error) {
 			}
 		}
 		if pj := get("ProxyJump"); !explicitJumps && pj != "" && pj != "none" {
-			jumps = strings.Split(pj, ",")
+			if cfg.Jumps, err = proxyJumps(parsed, pj, 0); err != nil {
+				return ssh.Config{}, err
+			}
 		}
 		if name := get("HostName"); name != "" {
 			cfg.Host = name
@@ -397,6 +458,56 @@ func sshConfig(conn cty.Value) (ssh.Config, error) {
 		cfg.PrivateKey = key
 	}
 	return cfg, nil
+}
+
+// proxyJumps resolves a ProxyJump value the way OpenSSH does: each hop's
+// alias is looked up in the same file for its HostName, User, Port and
+// IdentityFile, and its own ProxyJump hops come before it. A user or port
+// written in the hop itself wins.
+func proxyJumps(parsed *sshconfig.Config, value string, depth int) ([]ssh.Jump, error) {
+	if depth > 8 {
+		return nil, fmt.Errorf("ssh_config_file: ProxyJump %q goes through too many hops; is there a loop?", value)
+	}
+	var out []ssh.Jump
+	for _, spec := range strings.Split(value, ",") {
+		spec = strings.TrimSpace(spec)
+		jump, err := ssh.ParseJump(spec)
+		if err != nil {
+			return nil, err
+		}
+		alias := jump.Host
+		get := func(key string) string { v, _ := parsed.Get(alias, key); return v }
+		if pj := get("ProxyJump"); pj != "" && pj != "none" {
+			before, err := proxyJumps(parsed, pj, depth+1)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, before...)
+		}
+		if name := get("HostName"); name != "" {
+			jump.Host = name
+		}
+		if jump.User == "" {
+			jump.User = get("User")
+		}
+		_, after, _ := strings.Cut(spec, "@")
+		if _, _, err := net.SplitHostPort(after); err != nil { // no port written in the hop
+			if p := get("Port"); p != "" {
+				n, err := strconv.Atoi(p)
+				if err != nil || n < 1 || n > 65535 {
+					return nil, fmt.Errorf("ssh_config_file: Port %q for %s is not a port", p, alias)
+				}
+				jump.Port = n
+			}
+		}
+		if file := expandHome(get("IdentityFile")); file != "" {
+			if jump.PrivateKey, err = os.ReadFile(file); err != nil {
+				return nil, fmt.Errorf("reading private key %s for %s: %w", file, alias, err)
+			}
+		}
+		out = append(out, jump)
+	}
+	return out, nil
 }
 
 func stringOr(v cty.Value, fallback string) string {

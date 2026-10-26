@@ -21,6 +21,7 @@ import (
 	"github.com/zclconf/go-cty/cty"
 
 	"github.com/opentofu/opentofu/internal/conn3x/agent"
+	"github.com/opentofu/opentofu/internal/conn3x/transport/ssh"
 	"github.com/opentofu/opentofu/internal/providers"
 )
 
@@ -253,13 +254,133 @@ func TestAgentDeathSurfacesError(t *testing.T) {
 	}
 }
 
-func TestBecomeStaysOnShellForNow(t *testing.T) {
+func isRootStart(cmd string) bool {
+	return strings.HasPrefix(cmd, "LC_ALL=C exec sudo -S -p 'conn3x-sudo-")
+}
+
+func TestBecomeUsesTheAgent(t *testing.T) {
 	f, _ := newAgentTest(t)
 	f.server.FakeSudo(t, "nopasswd")
 	f.withConn(map[string]cty.Value{"agent": cty.True, "become": cty.True})
 	f.lifecycle()
-	if cmds := f.commands(); slices.ContainsFunc(cmds, isProbe) {
-		t.Fatalf("a become host probed for the agent:\n%s", strings.Join(cmds, "\n---\n"))
+	cmds := f.commands()
+	if n := len(slices.DeleteFunc(slices.Clone(cmds), func(c string) bool { return !isRootStart(c) })); n != 1 {
+		t.Fatalf("started %d root agents, want 1; commands:\n%s", n, strings.Join(cmds, "\n---\n"))
+	}
+	// Besides sudo's checks, every command went through the agent.
+	for _, c := range cmds {
+		if !isProbe(c) && !isRootStart(c) && !strings.Contains(c, "mktemp") && !strings.Contains(c, "sudo -n -- true") {
+			t.Errorf("ran outside the agent: %q", c)
+		}
+	}
+}
+
+func TestBecomeOneRootAgentPerHostAndUser(t *testing.T) {
+	f, _ := newAgentTest(t)
+	f.server.FakeSudo(t, "password:s3cret")
+	pw := func(p string) cty.Value {
+		file := filepath.Join(t.TempDir(), "pw")
+		if err := os.WriteFile(file, []byte(p+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return cty.StringVal(file)
+	}
+	f.withConn(map[string]cty.Value{"agent": cty.True, "become": cty.True, "become_password_file": pw("s3cret")})
+	first := f.conn
+	f.withConn(map[string]cty.Value{"user": cty.StringVal("other")})
+	second := f.conn
+	rootStarts := func() int {
+		return len(slices.DeleteFunc(f.server.Commands(), func(c string) bool { return !isRootStart(c) }))
+	}
+
+	// Two logins as different users, dialled at once: sudo may treat them
+	// differently, so each gets a root agent of its own.
+	conns := make([]*hostConn, 2)
+	var wg sync.WaitGroup
+	for i, conn := range []cty.Value{first, second} {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			h, err := dialForApply(ctx, conn)
+			if err != nil {
+				t.Error(err)
+			}
+			conns[i] = h
+		}()
+	}
+	wg.Wait()
+	if t.Failed() {
+		return
+	}
+	if conns[0] == conns[1] {
+		t.Fatal("two logins shared one connection")
+	}
+	if conns[0].agent == nil || conns[1].agent == nil || conns[0].agent == conns[1].agent {
+		t.Fatal("two users share one root agent")
+	}
+	for _, h := range conns {
+		if res, err := h.Run(ctx, `echo "$SUDO_USER"`, nil); err != nil || string(res.Stdout) != "fake\n" {
+			t.Fatalf("got %q, %v", res.Stdout, err)
+		}
+	}
+	if n := rootStarts(); n != 2 {
+		t.Fatalf("started %d root agents, want 2", n)
+	}
+
+	// Another connection as the first user shares that user's root agent.
+	t.Setenv("CONN3X_AGENT", "require")
+	again, err := dialForApply(ctx, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again == conns[0] || again.agent != conns[0].agent {
+		t.Fatal("a second connection as the same user didn't share its root agent")
+	}
+	if n := rootStarts(); n != 2 {
+		t.Fatalf("started %d root agents, want still 2", n)
+	}
+
+	// A login whose sudo fails gets no root agent.
+	f.withConn(map[string]cty.Value{"user": cty.StringVal("third"), "become_password_file": pw("wrong")})
+	if _, err := dialForApply(ctx, f.conn); err == nil || !strings.Contains(err.Error(), "incorrect password") {
+		t.Fatalf("dial with a wrong password = %v, want the incorrect password error", err)
+	}
+}
+
+// A connection whose sudo refused the agent never runs later commands in
+// the shell instead, under require.
+func TestBecomeRefusedStaysRefused(t *testing.T) {
+	f, _ := newAgentTest(t)
+	f.server.FakeSudo(t, "password:s3cret")
+	t.Setenv("CONN3X_AGENT", "require")
+	file := filepath.Join(t.TempDir(), "pw")
+	if err := os.WriteFile(file, []byte("wrong\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f.withConn(map[string]cty.Value{"become": cty.True, "become_password_file": cty.StringVal(file)})
+	for i := range 2 {
+		if _, err := dialForApply(ctx, f.conn); err == nil || !strings.Contains(err.Error(), "incorrect password") {
+			t.Fatalf("dial %d = %v, want the incorrect password error", i+1, err)
+		}
+	}
+}
+
+func TestRootKey(t *testing.T) {
+	cfg := ssh.Config{Host: "web1", Port: 22, User: "deploy", KnownHostsFile: "/k"}
+	other := cfg
+	other.Port = 2222
+	if rootKey(cfg) == rootKey(other) {
+		t.Fatal("another port shares the root agent")
+	}
+	other = cfg
+	other.User = "admin"
+	if rootKey(cfg) == rootKey(other) {
+		t.Fatal("another user shares the root agent")
+	}
+	other = cfg
+	other.PrivateKey = []byte("another key")
+	if rootKey(cfg) != rootKey(other) {
+		t.Fatal("the same user with another key doesn't share the root agent")
 	}
 }
 
@@ -299,19 +420,16 @@ func TestRequireTurnsUnavailableIntoError(t *testing.T) {
 			if tc.attr != cty.NilVal {
 				f.withConn(map[string]cty.Value{"agent": tc.attr})
 			}
-			bin := t.TempDir()
-			if err := os.WriteFile(filepath.Join(bin, "uname"), []byte("#!/bin/sh\necho riscv64\n"), 0o755); err != nil {
-				t.Fatal(err)
-			}
-			f.server.Env = append(f.server.Env, "PATH="+bin+":"+os.Getenv("PATH"))
+			// A build with no agent in it.
+			agentPayload = func(string) ([]byte, [32]byte, error) { return nil, [32]byte{}, errors.New("not embedded") }
 
 			cfg := f.config(map[string]cty.Value{"content": cty.StringVal("hi\n")})
 			null := cty.NullVal(cfg.Type())
 			resp := f.p.ApplyResourceChange(ctx, providers.ApplyResourceChangeRequest{
 				TypeName: "conn3x_file", PriorState: null, PlannedState: f.plan(null, cfg).PlannedState, Config: cfg,
 			})
-			if !resp.Diagnostics.HasErrors() || !strings.Contains(resp.Diagnostics.Err().Error(), "riscv64") {
-				t.Fatalf("apply on a host that can't run the agent = %v, want an error naming riscv64", resp.Diagnostics.Err())
+			if !resp.Diagnostics.HasErrors() || !strings.Contains(resp.Diagnostics.Err().Error(), "has none") {
+				t.Fatalf("apply without an agent to run = %v, want an error saying the build has none", resp.Diagnostics.Err())
 			}
 			if _, err := os.Stat(f.path); err == nil {
 				t.Fatal("the file was written through the shell anyway")
