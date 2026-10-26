@@ -56,19 +56,41 @@ func NormalizeMode(mode string) string {
 
 const notRegular = 3
 
+// unreadable is the exit code for a file the login user can't read. Without
+// it, base64's failure is lost in the pipe and the file reads as empty.
+const unreadable = 4
+
 // Read reports the file's current state. A missing file is not an error.
+// A runner that is a modules.FileReader answers natively when it can.
 func Read(ctx context.Context, r modules.Runner, p string) (Actual, error) {
+	if fr, ok := r.(modules.FileReader); ok {
+		st, err := fr.ReadFile(ctx, p)
+		switch {
+		case err == nil && !st.Exists:
+			return Actual{}, nil
+		case err == nil && !st.Regular:
+			return Actual{}, notRegularError(p)
+		case err == nil:
+			return Actual{Exists: true, Content: string(st.Content), Mode: fmt.Sprintf("%04o", st.Mode), Owner: st.Owner, Group: st.Group}, nil
+		case !errors.Is(err, errors.ErrUnsupported):
+			return Actual{}, err
+		}
+	}
 	q := ssh.Quote(p)
 	script := fmt.Sprintf(`p=%s
 [ -e "$p" ] || [ -L "$p" ] || { echo missing; exit 0; }
 [ -f "$p" ] || exit %d
+[ -r "$p" ] || { id -un; exit %d; }
 echo present
 stat -c '%%a %%U %%G' -- "$p" 2>/dev/null || stat -f '%%Lp %%Su %%Sg' "$p"
-base64 < "$p" | tr -d '\n'`, q, notRegular)
+base64 < "$p" | tr -d '\n'`, q, notRegular, unreadable)
 	res, err := run(ctx, r, script, nil)
 	if err != nil {
 		if res.ExitCode == notRegular {
-			return Actual{}, fmt.Errorf("%s exists but is not a regular file", p)
+			return Actual{}, notRegularError(p)
+		}
+		if res.ExitCode == unreadable {
+			return Actual{}, fmt.Errorf("%s exists but can't be read by %s", p, strings.TrimSpace(string(res.Stdout)))
 		}
 		return Actual{}, err
 	}
@@ -98,6 +120,10 @@ base64 < "$p" | tr -d '\n'`, q, notRegular)
 		Owner:   meta[1],
 		Group:   meta[2],
 	}, nil
+}
+
+func notRegularError(p string) error {
+	return fmt.Errorf("%s exists but is not a regular file", p)
 }
 
 // NeedsChange reports whether Apply would change anything.
