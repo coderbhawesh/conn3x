@@ -6,12 +6,14 @@ package provider
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/zclconf/go-cty/cty"
 
 	"github.com/opentofu/opentofu/internal/providers"
+	"github.com/opentofu/opentofu/internal/tfdiags"
 )
 
 var testHMACKey = strings.Repeat("k", 32)
@@ -194,5 +196,78 @@ func TestFileWriteOnlyReadDoesNotCreateKey(t *testing.T) {
 	}
 	if path, _ := hmacKeyPath(); fileExists(path) {
 		t.Fatal("read created a key file")
+	}
+}
+
+func TestFileWriteOnlyWarnsWhenKeyFileIsReadableByOthers(t *testing.T) {
+	f := newWOTest(t)
+	t.Setenv("CONN3X_HMAC_KEY", "")
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	hmacKeyWarningShown = ""
+	if _, err := hmacKey(true); err != nil {
+		t.Fatal(err)
+	}
+	path, _ := hmacKeyPath()
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := f.config(map[string]cty.Value{"content_wo": cty.StringVal("s3cret")})
+	planned := f.plan(cty.NullVal(cfg.Type()), cfg)
+	if planned.Diagnostics.HasErrors() {
+		t.Fatal(planned.Diagnostics.Err())
+	}
+	if len(planned.Diagnostics) != 1 || planned.Diagnostics[0].Severity() != tfdiags.Warning {
+		t.Fatalf("plan diagnostics = %#v, want one warning", planned.Diagnostics)
+	}
+	msg := planned.Diagnostics[0].Description().Summary
+	for _, want := range []string{path, "readable by group or other users", "chmod 600 " + path} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("warning %q doesn't mention %q", msg, want)
+		}
+	}
+
+	hmacKeyWarningShown = ""
+	state, _ := f.createWO("s3cret")
+	hmacKeyWarningShown = ""
+	read := f.p.ReadResource(ctx, providers.ReadResourceRequest{TypeName: "conn3x_file", PriorState: state})
+	if read.Diagnostics.HasErrors() || len(read.Diagnostics) != 1 || read.Diagnostics[0].Severity() != tfdiags.Warning {
+		t.Fatalf("read diagnostics = %#v, want one warning", read.Diagnostics)
+	}
+}
+
+func TestFileWriteOnlyDoesNotWarnForPrivateKeyFile(t *testing.T) {
+	f := newWOTest(t)
+	t.Setenv("CONN3X_HMAC_KEY", "")
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	hmacKeyWarningShown = ""
+	if _, err := hmacKey(true); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := f.config(map[string]cty.Value{"content_wo": cty.StringVal("s3cret")})
+	planned := f.plan(cty.NullVal(cfg.Type()), cfg)
+	if len(planned.Diagnostics) != 0 {
+		t.Fatalf("plan diagnostics = %#v, want none", planned.Diagnostics)
+	}
+}
+
+func TestFileWriteOnlyDoesNotWarnForEnvironmentKey(t *testing.T) {
+	f := newWOTest(t)
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	hmacKeyWarningShown = ""
+	path := filepath.Join(dir, "conn3x", "hmac.key")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(strings.Repeat("z", 32)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := f.config(map[string]cty.Value{"content_wo": cty.StringVal("s3cret")})
+	planned := f.plan(cty.NullVal(cfg.Type()), cfg)
+	if len(planned.Diagnostics) != 0 {
+		t.Fatalf("plan diagnostics = %#v, want none for CONN3X_HMAC_KEY", planned.Diagnostics)
 	}
 }

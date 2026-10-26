@@ -115,6 +115,33 @@ func TestHMACKeyFileTrimsNewline(t *testing.T) {
 	}
 }
 
+func TestHMACKeyPermissionWarning(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	t.Setenv("CONN3X_HMAC_KEY", "")
+	hmacKeyWarningShown = ""
+	path := filepath.Join(dir, "conn3x", "hmac.key")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(strings.Repeat("k", 32)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := hmacKeyPermissionWarning(); err != nil {
+		t.Fatalf("private key file warned: %v", err)
+	}
+	if err := os.Chmod(path, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	err := hmacKeyPermissionWarning()
+	if err == nil || !strings.Contains(err.Error(), path) || !strings.Contains(err.Error(), "chmod 600") {
+		t.Fatalf("group-readable key warning = %v", err)
+	}
+	if err := hmacKeyPermissionWarning(); err != nil {
+		t.Fatalf("warning repeated: %v", err)
+	}
+}
+
 func TestHMACKeyConcurrentFirstUse(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("CONN3X_HMAC_KEY", "")

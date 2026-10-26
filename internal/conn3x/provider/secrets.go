@@ -25,7 +25,10 @@ const hmacKeyEnv = "CONN3X_HMAC_KEY"
 
 // keyFileMu serialises first use within one process; the hard link below
 // covers other processes.
-var keyFileMu sync.Mutex
+var (
+	keyFileMu           sync.Mutex
+	hmacKeyWarningShown string
+)
 
 // hmacKey returns the key from CONN3X_HMAC_KEY, or from a key file in the
 // user's config directory. With create, a missing key file is made: 64 hex
@@ -91,6 +94,38 @@ func readKeyFile(path string) ([]byte, error) {
 		return nil, fmt.Errorf("%s must hold at least 32 bytes", path)
 	}
 	return key, nil
+}
+
+// hmacKeyPermissionWarning reports a key file that other local users can
+// read. It is only used on paths that already read the file: a plan or read
+// must not create a missing key just to check its permissions.
+func hmacKeyPermissionWarning() error {
+	if os.Getenv(hmacKeyEnv) != "" {
+		return nil
+	}
+	path, err := hmacKeyPath()
+	if err != nil {
+		return nil
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		return permissionWarning(path, "readable by group or other users", "chmod 600")
+	}
+	return nil
+}
+
+func permissionWarning(path, problem, fix string) error {
+	message := fmt.Sprintf("%s is %s; run %s %s to keep the HMAC key private", path, problem, fix, path)
+	keyFileMu.Lock()
+	defer keyFileMu.Unlock()
+	if hmacKeyWarningShown == message {
+		return nil
+	}
+	hmacKeyWarningShown = message
+	return fmt.Errorf("%s", message)
 }
 
 func hmacKeyPath() (string, error) {

@@ -105,6 +105,9 @@ func planFile(req providers.PlanResourceChangeRequest) providers.PlanResourceCha
 			resp.Diagnostics = resp.Diagnostics.Append(attrError("content_wo", err.Error()))
 			return resp
 		}
+		if err := hmacKeyPermissionWarning(); err != nil {
+			resp.Diagnostics = resp.Diagnostics.Append(tfdiags.SimpleWarning(err.Error()))
+		}
 		if path := vals["path"]; wo.IsKnown() && path.IsKnown() {
 			vals["content_hmac"] = cty.StringVal(contentHMAC(key, path.AsString(), wo.AsString()))
 		}
@@ -142,6 +145,11 @@ func readFile(ctx context.Context, req providers.ReadResourceRequest) providers.
 	resp := providers.ReadResourceResponse{NewState: req.PriorState}
 	if req.PriorState.IsNull() {
 		return resp
+	}
+	if !req.PriorState.GetAttr("content_hmac").IsNull() {
+		if err := hmacKeyPermissionWarning(); err != nil {
+			resp.Diagnostics = resp.Diagnostics.Append(tfdiags.SimpleWarning(err.Error()))
+		}
 	}
 	client, err := dialConnection(ctx, req.PriorState.GetAttr("ssh"))
 	if err != nil {

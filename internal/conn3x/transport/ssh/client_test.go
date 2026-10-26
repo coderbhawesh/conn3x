@@ -224,3 +224,199 @@ func TestQuote(t *testing.T) {
 func testConfig(t *testing.T, s *sshtest.Server) Config {
 	return Config{Host: s.Host, Port: s.Port, User: "test", PrivateKey: s.ClientKey, KnownHostsFile: s.KnownHosts(t)}
 }
+
+// runParallel runs n commands at once on c and fails on any error.
+func runParallel(t *testing.T, c *Client, n int) {
+	t.Helper()
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			res, err := c.Run(context.Background(), "sleep 0.1; echo ok", nil)
+			if err == nil && strings.TrimSpace(string(res.Stdout)) != "ok" {
+				err = errors.New("output " + string(res.Stdout))
+			}
+			errs <- err
+		}()
+	}
+	for i := 0; i < n; i++ {
+		if err := <-errs; err != nil {
+			t.Error(err)
+		}
+	}
+}
+
+// sshd allows ten sessions per connection by default; more commands than
+// that at once must queue, not fail.
+func TestRunQueuesBeyondMaxSessions(t *testing.T) {
+	s := sshtest.New(t)
+	s.MaxSessions = 10
+	runParallel(t, dial(t, testConfig(t, s)), 30)
+	// The cap is below the server's limit, and a slot comes back only
+	// once the server has freed its session, so nothing is ever refused.
+	if got := s.Rejections(); got != 0 {
+		t.Fatalf("server refused %d sessions under a cap below its limit", got)
+	}
+}
+
+// A server allowing fewer sessions than the cap still runs everything, and
+// each command exactly once. Five commands leave some of the cap's slots
+// free when the server starts refusing; twenty fill it.
+func TestRunAdaptsToLowerMaxSessions(t *testing.T) {
+	for _, n := range []int{5, 20} {
+		s := sshtest.New(t)
+		s.MaxSessions = 3
+		c := dial(t, testConfig(t, s))
+		runParallel(t, c, n)
+		if got := len(s.Commands()); got != n {
+			t.Fatalf("server ran %d commands, want %d", got, n)
+		}
+		c.mu.Lock()
+		limit := c.limit
+		c.mu.Unlock()
+		if limit != 3 {
+			t.Errorf("%d commands: cap ended at %d, want 3", n, limit)
+		}
+		// Only the opens in flight when the cap was found are refused,
+		// each once: past the cap of 8, the rest wait their turn.
+		if got, most := s.Rejections(), int64(min(n, defaultMaxSessions)-3); got > most {
+			t.Errorf("%d commands: server refused %d sessions, want at most %d", n, got, most)
+		}
+	}
+}
+
+// A session refused for any other reason fails at once, without retrying.
+func TestRunRefusedSessionFailsAtOnce(t *testing.T) {
+	s := sshtest.New(t)
+	s.RejectSessions = gossh.Prohibited
+	c := dial(t, testConfig(t, s))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := c.Run(ctx, "true", nil)
+	var open *gossh.OpenChannelError
+	if !errors.As(err, &open) || open.Reason != gossh.Prohibited {
+		t.Fatalf("Run = %v, want the server's refusal", err)
+	}
+	if got := s.Rejections(); got != 1 {
+		t.Fatalf("client tried %d times, want 1", got)
+	}
+}
+
+// Sessions that end together are given back after one keepalive between
+// them, not one each: keepalives that want a reply go out one at a time,
+// so one each would free the slots a round trip apart.
+func TestSessionsEndingTogetherShareAKeepalive(t *testing.T) {
+	s := sshtest.New(t)
+	s.SetDelay(20 * time.Millisecond)
+	c := dial(t, testConfig(t, s))
+	const n = 32
+	runParallel(t, c, n)
+	// One each would be n. How many share depends on timing: about 12
+	// locally, 17 on a CI runner.
+	if got := s.Keepalives(); got >= n*3/4 {
+		t.Fatalf("%d commands sent %d keepalives, want fewer than %d", n, got, n*3/4)
+	}
+}
+
+// A server that stops answering keepalives can't hold slots forever: the
+// connection is closed, and commands waiting for a slot fail instead of
+// hanging.
+func TestUnansweredKeepaliveClosesConnection(t *testing.T) {
+	t.Setenv("CONN3X_SSH_MAX_SESSIONS", "1")
+	defer func(d time.Duration) { keepaliveTimeout = d }(keepaliveTimeout)
+	keepaliveTimeout = 200 * time.Millisecond
+	s := sshtest.New(t)
+	s.IgnoreKeepalives = true
+	c := dial(t, testConfig(t, s))
+	if _, err := c.Run(context.Background(), "true", nil); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := c.Run(ctx, "true", nil); err == nil || errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Run waiting for a slot = %v, want the connection's error", err)
+	}
+}
+
+// BenchmarkQuickCommandsAtDelay runs 64 quick commands at once on a host
+// 50 ms away, so the cap of 8 turns over many times.
+func BenchmarkQuickCommandsAtDelay(b *testing.B) {
+	s := sshtest.New(b)
+	s.SetDelay(50 * time.Millisecond)
+	c, err := Dial(context.Background(), Config{Host: s.Host, Port: s.Port, User: "test", PrivateKey: s.ClientKey, KnownHostsFile: s.KnownHosts(b)})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer c.Close()
+	for b.Loop() {
+		errs := make(chan error, 64)
+		for range 64 {
+			go func() { _, err := c.Run(context.Background(), "true", nil); errs <- err }()
+		}
+		for range 64 {
+			if err := <-errs; err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+}
+
+func TestRunCancelledWhileWaitingForSession(t *testing.T) {
+	t.Setenv("CONN3X_SSH_MAX_SESSIONS", "1")
+	s := sshtest.New(t)
+	c := dial(t, testConfig(t, s))
+
+	holdCtx, release := context.WithCancel(context.Background())
+	held := make(chan error, 1)
+	go func() { _, err := c.Run(holdCtx, "sleep 30", nil); held <- err }()
+	for len(s.Commands()) == 0 {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	waited := make(chan error, 1)
+	go func() { _, err := c.Run(ctx, "echo never", nil); waited <- err }()
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-waited:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("waiting Run = %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelled Run is still waiting for a session")
+	}
+
+	// Cancelling the running command gives its slot back.
+	release()
+	if err := <-held; !errors.Is(err, context.Canceled) {
+		t.Fatalf("held Run = %v", err)
+	}
+	if _, err := c.Run(context.Background(), "true", nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, cmd := range s.Commands() {
+		if strings.Contains(cmd, "never") {
+			t.Fatal("the cancelled command ran")
+		}
+	}
+}
+
+// A started process, such as the agent, holds its session until Close.
+func TestStartHoldsSessionUntilClose(t *testing.T) {
+	t.Setenv("CONN3X_SSH_MAX_SESSIONS", "1")
+	s := sshtest.New(t)
+	c := dial(t, testConfig(t, s))
+	p, err := c.Start(context.Background(), "cat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if _, err := c.Run(ctx, "true", nil); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Run while the process is open = %v, want a deadline", err)
+	}
+	p.Close()
+	if _, err := c.Run(context.Background(), "true", nil); err != nil {
+		t.Fatal(err)
+	}
+}
