@@ -65,9 +65,16 @@ func ReadSysctl(ctx context.Context, r modules.Runner, key string) (string, erro
 }
 
 // ApplySysctl writes the drop-in file and loads it into the running kernel.
+// Some minimal images, such as Rocky Linux's ubi-init, have no /etc/sysctl.d,
+// so it is created first.
 func ApplySysctl(ctx context.Context, r modules.Runner, s Sysctl) error {
 	if err := s.Validate(); err != nil {
 		return err
+	}
+	if res, err := r.Run(ctx, "mkdir -p -m 0755 /etc/sysctl.d", nil); err != nil {
+		return err
+	} else if res.ExitCode != 0 {
+		return fmt.Errorf("creating /etc/sysctl.d: %s", strings.TrimSpace(string(res.Stderr)))
 	}
 	if err := file.Apply(ctx, r, file.Desired{Path: s.Path(), Content: s.Content(), Mode: "0644", Owner: "root", Group: "root"}); err != nil {
 		return err
