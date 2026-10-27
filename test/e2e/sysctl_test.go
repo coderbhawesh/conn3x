@@ -21,9 +21,11 @@ func TestSysctlCreatesDropInDir(t *testing.T) {
 	for _, image := range linuxImages {
 		t.Run(image, func(t *testing.T) {
 			// Podman mounts /proc/sys read-only; a real host's root can write
-			// it. The port range is per network namespace, so the container's
-			// value doesn't touch the machine running the tests.
-			h := startHostWith(t, image, "--security-opt", "unmask=/proc/sys")
+			// it, and --privileged lets the container's root do the same.
+			// Rootless, that stays inside the container's user and network
+			// namespaces, and the port range is per network namespace, so the
+			// container's value doesn't touch the machine running the tests.
+			h := startHostWith(t, image, "--privileged")
 			pkg := "procps"
 			if rpmImage(image) {
 				pkg = "procps-ng"
