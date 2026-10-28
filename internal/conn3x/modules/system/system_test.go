@@ -4,10 +4,13 @@
 package system
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/opentofu/opentofu/internal/conn3x/transport/ssh"
 )
 
 func TestSysctl(t *testing.T) {
@@ -80,6 +83,39 @@ func TestTimezone(t *testing.T) {
 func TestSysctlKeyIsNotAFlag(t *testing.T) {
 	if (Sysctl{Key: "-p/etc/shadow", Value: "1"}).Validate() == nil {
 		t.Fatal("accepted a key that sysctl reads as a flag")
+	}
+}
+
+// sysctlHost answers sysctl -n with live and every other command with
+// success, as Ubuntu 24.04 does when the kernel refuses a key.
+type sysctlHost struct {
+	live string
+	ran  []string
+}
+
+func (h *sysctlHost) Run(_ context.Context, cmd string, _ []byte) (ssh.Result, error) {
+	h.ran = append(h.ran, cmd)
+	if strings.HasPrefix(cmd, "sysctl -n ") {
+		return ssh.Result{Stdout: []byte(h.live)}, nil
+	}
+	return ssh.Result{}, nil
+}
+
+func TestApplySysctlChecksTheKernelTookTheValue(t *testing.T) {
+	s := Sysctl{Key: "net.ipv4.ip_local_port_range", Value: "20000 60999"}
+	h := &sysctlHost{live: "32768\t60999\n"}
+	err := ApplySysctl(context.Background(), h, s)
+	if err == nil || !strings.Contains(err.Error(), `kept "32768 60999"`) {
+		t.Fatalf("apply = %v, want it to fail and name the value the kernel kept", err)
+	}
+
+	// sysctl -n separates multi-value settings with tabs.
+	h = &sysctlHost{live: "20000\t60999\n"}
+	if err := ApplySysctl(context.Background(), h, s); err != nil {
+		t.Fatal(err)
+	}
+	if last := h.ran[len(h.ran)-1]; !strings.HasPrefix(last, "sysctl -n ") || !strings.HasPrefix(h.ran[len(h.ran)-2], "sysctl -p ") {
+		t.Fatalf("want sysctl -p, then the read-back, last; ran %q", h.ran)
 	}
 }
 

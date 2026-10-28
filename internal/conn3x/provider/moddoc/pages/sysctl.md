@@ -44,7 +44,7 @@ step "port_range" {
 
 **Reading.** On every plan, Conn3x reads the parameter's file in `/etc/sysctl.d` and the running value from `sysctl -n`. `in_sync` is true only when both match. Runs of spaces and tabs in a value compare as a single space, so `"32768 60999"` matches however the kernel prints it.
 
-**Applying.** Conn3x writes `/etc/sysctl.d/90-conn3x-<name>.conf`, owned by root with mode `"0644"`, then loads it with `sysctl -p`. If the host has no `/etc/sysctl.d`, as on some minimal container images, Conn3x creates it with mode `"0755"`. A `/` in the name, as in an interface name such as `eth0/100`, becomes `_` in the file name.
+**Applying.** Conn3x writes `/etc/sysctl.d/90-conn3x-<name>.conf`, owned by root with mode `"0644"`, then loads it with `sysctl -p` and reads the running value back. If the kernel kept a different value, as when the key is read-only in a container, the step fails rather than reporting success. If the host has no `/etc/sysctl.d`, as on some minimal container images, Conn3x creates it with mode `"0755"`. A `/` in the name, as in an interface name such as `eth0/100`, becomes `_` in the file name.
 
 **Reboots.** The host loads the files in `/etc/sysctl.d` at boot, so the value comes back after a reboot.
 

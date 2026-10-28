@@ -66,7 +66,8 @@ func ReadSysctl(ctx context.Context, r modules.Runner, key string) (string, erro
 
 // ApplySysctl writes the drop-in file and loads it into the running kernel.
 // Some minimal images, such as Rocky Linux's ubi-init, have no /etc/sysctl.d,
-// so it is created first.
+// so it is created first. Some sysctl builds, such as Ubuntu 24.04's, exit 0
+// when the kernel refuses a key, so the running value is read back after.
 func ApplySysctl(ctx context.Context, r modules.Runner, s Sysctl) error {
 	if err := s.Validate(); err != nil {
 		return err
@@ -79,7 +80,17 @@ func ApplySysctl(ctx context.Context, r modules.Runner, s Sysctl) error {
 	if err := file.Apply(ctx, r, file.Desired{Path: s.Path(), Content: s.Content(), Mode: "0644", Owner: "root", Group: "root"}); err != nil {
 		return err
 	}
-	return check(r.Run(ctx, "sysctl -p "+ssh.Quote(s.Path()), nil))
+	if err := check(r.Run(ctx, "sysctl -p "+ssh.Quote(s.Path()), nil)); err != nil {
+		return err
+	}
+	live, err := ReadSysctl(ctx, r, s.Key)
+	if err != nil {
+		return err
+	}
+	if !s.Matches(live) {
+		return fmt.Errorf("the kernel kept %q after loading %s; the key may be read-only on this host, as in a container", normalize(live), s.Path())
+	}
+	return nil
 }
 
 var hostLabel = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$`)
