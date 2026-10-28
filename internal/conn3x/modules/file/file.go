@@ -153,6 +153,7 @@ func Apply(ctx context.Context, r modules.Runner, d Desired) error {
 	}
 	script := fmt.Sprintf(`set -e
 p=%s
+mkdir -p -- "$(dirname -- "$p")"
 tmp=$(mktemp "$(dirname -- "$p")/.conn3x.XXXXXX")
 trap 'rm -f -- "$tmp"' EXIT
 cat > "$tmp"

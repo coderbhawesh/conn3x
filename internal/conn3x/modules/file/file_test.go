@@ -69,6 +69,17 @@ func TestApplyRoundTrip(t *testing.T) {
 	}
 }
 
+func TestApplyCreatesMissingParentDirectory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing", "nested", "f")
+	if err := Apply(ctx, localRunner{}, Desired{Path: path, Content: "x", Mode: "0644"}); err != nil {
+		t.Fatalf("Apply with a missing parent directory: %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil || string(got) != "x" {
+		t.Fatalf("got %q, %v", got, err)
+	}
+}
+
 func TestAwkwardPath(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "it's a $(file)")
 	if err := Apply(ctx, localRunner{}, Desired{Path: path, Content: "x", Mode: "0644"}); err != nil {
