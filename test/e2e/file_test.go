@@ -67,6 +67,45 @@ func TestFileLifecycle(t *testing.T) {
 	}
 }
 
+func TestFileAbsent(t *testing.T) {
+	h := startHost(t, "rocky10")
+	h.exec("", "sh", "-c", "mkdir -p /etc/app && echo old > /etc/app/legacy.conf")
+	w := newWorkdir(t, "file_absent")
+	w.write(fileVars{Port: h.port, KeyFile: h.keyFile, KnownHosts: h.knownHosts})
+	w.mustConn3x("init", "-no-color")
+
+	w.mustConn3x("apply", "-auto-approve", "-no-color")
+	if got := h.exec("", "sh", "-c", "test -e /etc/app/legacy.conf && echo present || echo gone"); got != "gone\n" {
+		t.Fatalf("/etc/app/legacy.conf after apply: %s", got)
+	}
+	if out := w.mustConn3x("plan", "-no-color"); !strings.Contains(out, "No changes.") {
+		t.Fatalf("second plan is not empty:\n%s", out)
+	}
+
+	// A file that comes back is out of sync, and apply removes it again.
+	h.exec("", "sh", "-c", "echo again > /etc/app/legacy.conf")
+	out := w.mustConn3x("plan", "-no-color")
+	for _, want := range []string{`~ resource "conn3x_file" "legacy"`, "1 to change"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("plan missing %q:\n%s", want, out)
+		}
+	}
+	w.mustConn3x("apply", "-auto-approve", "-no-color")
+	if out := w.mustConn3x("plan", "-no-color"); !strings.Contains(out, "No changes.") {
+		t.Fatalf("plan after removing it again is not empty:\n%s", out)
+	}
+
+	// Starting from empty state with the path already missing, apply
+	// succeeds and the next plan is clean.
+	w = newWorkdir(t, "file_absent")
+	w.write(fileVars{Port: h.port, KeyFile: h.keyFile, KnownHosts: h.knownHosts})
+	w.mustConn3x("init", "-no-color")
+	w.mustConn3x("apply", "-auto-approve", "-no-color")
+	if out := w.mustConn3x("plan", "-no-color"); !strings.Contains(out, "No changes.") {
+		t.Fatalf("plan for a missing path is not empty:\n%s", out)
+	}
+}
+
 func TestFileUnknownHostKeyFailsApply(t *testing.T) {
 	h := startHost(t, "rocky10")
 	w := newWorkdir(t, "file")
