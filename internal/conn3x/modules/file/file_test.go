@@ -157,6 +157,27 @@ func TestReadRejectsDirectory(t *testing.T) {
 	}
 }
 
+func TestExists(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "f")
+	if ok, err := Exists(ctx, localRunner{}, path); err != nil || ok {
+		t.Fatalf("missing file: exists=%v err=%v", ok, err)
+	}
+	// Unreadable still counts: Exists never opens the file.
+	_ = os.WriteFile(path, []byte("x"), 0o000)
+	if ok, err := Exists(ctx, localRunner{}, path); err != nil || !ok {
+		t.Fatalf("file: exists=%v err=%v", ok, err)
+	}
+	if _, err := Exists(ctx, localRunner{}, dir); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("directory: err = %v, want not a regular file", err)
+	}
+	link := filepath.Join(dir, "dangling")
+	_ = os.Symlink(filepath.Join(dir, "nowhere"), link)
+	if _, err := Exists(ctx, localRunner{}, link); err == nil {
+		t.Fatal("a dangling symlink read as a file or as missing")
+	}
+}
+
 func TestValidate(t *testing.T) {
 	for _, bad := range []Desired{
 		{Path: "relative", Mode: "0644"},

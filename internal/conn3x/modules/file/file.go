@@ -122,6 +122,23 @@ base64 < "$p" | tr -d '\n'`, q, notRegular, unreadable)
 	}, nil
 }
 
+// Exists reports whether a regular file is at p, without reading it, so a
+// file the login user can't read still counts. Something else at the path
+// is an error, as it is for Read.
+func Exists(ctx context.Context, r modules.Runner, p string) (bool, error) {
+	res, err := run(ctx, r, fmt.Sprintf(`p=%s
+[ -e "$p" ] || [ -L "$p" ] || { echo missing; exit 0; }
+[ -f "$p" ] || exit %d
+echo present`, ssh.Quote(p), notRegular), nil)
+	if err != nil {
+		if res.ExitCode == notRegular {
+			return false, notRegularError(p)
+		}
+		return false, err
+	}
+	return strings.TrimSpace(string(res.Stdout)) == "present", nil
+}
+
 func notRegularError(p string) error {
 	return fmt.Errorf("%s exists but is not a regular file", p)
 }

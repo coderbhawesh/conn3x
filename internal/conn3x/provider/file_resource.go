@@ -23,6 +23,8 @@ const (
 	onRemoveForget  = "forget"
 	onRemoveDelete  = "delete"
 	defaultOnRemove = onRemoveForget
+	statePresent    = "present"
+	stateAbsent     = "absent"
 )
 
 func fileSchema() providers.Schema {
@@ -33,10 +35,10 @@ func fileSchema() providers.Schema {
 				"id":       {Type: cty.String, Computed: true},
 				"revision": revisionAttr(),
 				"path":     {Type: cty.String, Required: true, Description: "Absolute path of the file on the host."},
-				"content":  {Type: cty.String, Optional: true, Description: "Exact content of the file. Set this or content_wo."},
+				"content":  {Type: cty.String, Optional: true, Description: "Exact content of the file. Set this or content_wo, unless state is \"absent\"."},
 				"content_wo": {
 					Type: cty.String, Optional: true, WriteOnly: true, Sensitive: true,
-					Description: "Exact content of the file, kept out of state: state records only content_hmac. Use it for secrets. Set this or content.",
+					Description: "Exact content of the file, kept out of state: state records only content_hmac. Use it for secrets. Set this or content, unless state is \"absent\".",
 				},
 				"content_hmac": {Type: cty.String, Computed: true, Description: "HMAC-SHA256 of content_wo, keyed by CONN3X_HMAC_KEY or ~/.config/conn3x/hmac.key. Null when content is used."},
 				"mode":         {Type: cty.String, Optional: true, Computed: true, Description: "Octal permissions. Defaults to \"0644\", or \"0600\" with content_wo."},
@@ -44,6 +46,8 @@ func fileSchema() providers.Schema {
 				"group":        {Type: cty.String, Optional: true, Description: "Owning group. Left as is when unset."},
 				"on_remove":    {Type: cty.String, Optional: true, Computed: true, Description: "What happens on the host when this resource is removed: \"forget\" (default) leaves the file, \"delete\" removes it."},
 				"sha256":       {Type: cty.String, Computed: true, Description: "SHA-256 of the content, hex encoded."},
+				"state":        {Type: cty.String, Optional: true, Description: "\"present\" (default) or \"absent\", which removes the file and keeps it gone."},
+				"in_sync":      {Type: cty.Bool, Computed: true, Description: "With state \"absent\", whether the file is already gone. Null otherwise."},
 			},
 			BlockTypes: map[string]*configschema.NestedBlock{
 				"ssh": connectionBlock(),
@@ -58,7 +62,17 @@ func validateFile(cfg cty.Value) tfdiags.Diagnostics {
 		return diags
 	}
 	diags = diags.Append(validateOnRemove(cfg))
-	if cfg.GetAttr("content").IsNull() == cfg.GetAttr("content_wo").IsNull() {
+	switch state := cfg.GetAttr("state"); {
+	case !state.IsKnown():
+	case fileAbsent(cfg):
+		for _, attr := range []string{"content", "content_wo", "mode", "owner", "group"} {
+			if !cfg.GetAttr(attr).IsNull() {
+				diags = diags.Append(attrError(attr, fmt.Sprintf("%s can't be set with state = %q", attr, stateAbsent)))
+			}
+		}
+	case !state.IsNull() && state.AsString() != statePresent:
+		diags = diags.Append(attrError("state", fmt.Sprintf("state must be %q or %q, not %q", statePresent, stateAbsent, state.AsString())))
+	case cfg.GetAttr("content").IsNull() == cfg.GetAttr("content_wo").IsNull():
 		diags = diags.Append(attrError("content", "set exactly one of content and content_wo"))
 	}
 	path, mode := cfg.GetAttr("path"), cfg.GetAttr("mode")
@@ -84,14 +98,28 @@ func planFile(req providers.PlanResourceChangeRequest) providers.PlanResourceCha
 		return resp
 	}
 	vals := req.ProposedNewState.AsValueMap()
+	if vals["on_remove"].IsNull() {
+		vals["on_remove"] = cty.StringVal(defaultOnRemove)
+	}
+	if !vals["state"].IsKnown() {
+		// Whether the file should exist isn't known yet, so neither is
+		// anything read from it.
+		if vals["mode"].IsNull() {
+			vals["mode"] = cty.UnknownVal(cty.String)
+		}
+		vals["content_wo"] = cty.NullVal(cty.String)
+		vals["sha256"], vals["content_hmac"], vals["in_sync"] = cty.UnknownVal(cty.String), cty.UnknownVal(cty.String), cty.UnknownVal(cty.Bool)
+		return finishFilePlan(req, resp, vals)
+	}
+	if fileAbsent(req.ProposedNewState) {
+		return planAbsentFile(req, resp, vals)
+	}
+	vals["in_sync"] = cty.NullVal(cty.Bool)
 	if vals["mode"].IsNull() {
 		vals["mode"] = cty.StringVal(defaultMode)
 		if !req.Config.GetAttr("content_wo").IsNull() {
 			vals["mode"] = cty.StringVal("0600")
 		}
-	}
-	if vals["on_remove"].IsNull() {
-		vals["on_remove"] = cty.StringVal(defaultOnRemove)
 	}
 	if mode := vals["mode"]; mode.IsKnown() {
 		vals["mode"] = cty.StringVal(file.NormalizeMode(mode.AsString()))
@@ -119,6 +147,31 @@ func planFile(req providers.PlanResourceChangeRequest) providers.PlanResourceCha
 			vals["sha256"] = cty.UnknownVal(cty.String)
 		}
 	}
+	return finishFilePlan(req, resp, vals)
+}
+
+// planAbsentFile plans a file that must not exist. Nothing about its
+// content is tracked; in_sync says whether it is already gone.
+func planAbsentFile(req providers.PlanResourceChangeRequest, resp providers.PlanResourceChangeResponse, vals map[string]cty.Value) providers.PlanResourceChangeResponse {
+	for _, attr := range []string{"content", "content_wo", "content_hmac", "sha256", "mode"} {
+		vals[attr] = cty.NullVal(cty.String)
+	}
+	stale := req.PriorState.IsNull() || !fileAbsent(req.PriorState)
+	if !stale {
+		if s := req.PriorState.GetAttr("in_sync"); !known(s) || s.False() {
+			stale = true
+		}
+	}
+	vals["in_sync"] = cty.True
+	if stale {
+		vals["in_sync"] = cty.UnknownVal(cty.Bool)
+	}
+	return finishFilePlan(req, resp, vals)
+}
+
+// finishFilePlan sets the id and replaces the file when its path or host
+// changes.
+func finishFilePlan(req providers.PlanResourceChangeRequest, resp providers.PlanResourceChangeResponse, vals map[string]cty.Value) providers.PlanResourceChangeResponse {
 	host := req.ProposedNewState.GetAttr("ssh").GetAttr("host")
 	if path := vals["path"]; path.IsKnown() {
 		vals["id"] = planID(req, path.AsString())
@@ -141,6 +194,12 @@ func planFile(req providers.PlanResourceChangeRequest) providers.PlanResourceCha
 	return resp
 }
 
+// fileAbsent reports whether v asks for the file to be gone.
+func fileAbsent(v cty.Value) bool {
+	s := v.GetAttr("state")
+	return s.IsKnown() && !s.IsNull() && s.AsString() == stateAbsent
+}
+
 func readFile(ctx context.Context, req providers.ReadResourceRequest) providers.ReadResourceResponse {
 	resp := providers.ReadResourceResponse{NewState: req.PriorState}
 	if req.PriorState.IsNull() {
@@ -159,6 +218,17 @@ func readFile(ctx context.Context, req providers.ReadResourceRequest) providers.
 	defer client.Close()
 
 	path := req.PriorState.GetAttr("path").AsString()
+	if fileAbsent(req.PriorState) {
+		exists, err := file.Exists(ctx, client, path)
+		if err != nil {
+			resp.Diagnostics = resp.Diagnostics.Append(fmt.Errorf("reading %s: %w", path, err))
+			return resp
+		}
+		vals := req.PriorState.AsValueMap()
+		vals["in_sync"] = cty.BoolVal(!exists)
+		resp.NewState = cty.ObjectVal(vals)
+		return resp
+	}
 	actual, err := file.Read(ctx, client, path)
 	if err != nil {
 		resp.Diagnostics = resp.Diagnostics.Append(fmt.Errorf("reading %s: %w", path, err))
@@ -203,6 +273,23 @@ func applyFile(ctx context.Context, req providers.ApplyResourceChangeRequest) pr
 		return resp
 	}
 	defer client.Close()
+
+	if fileAbsent(planned) {
+		path := planned.GetAttr("path").AsString()
+		// Exists refuses a directory or anything else that isn't a file.
+		exists, err := file.Exists(ctx, client, path)
+		if err == nil && exists {
+			err = file.Delete(ctx, client, path)
+		}
+		if err != nil {
+			resp.Diagnostics = resp.Diagnostics.Append(fmt.Errorf("removing %s: %w", path, err))
+			return resp
+		}
+		vals := planned.AsValueMap()
+		vals["in_sync"] = cty.True
+		resp.NewState = cty.ObjectVal(vals)
+		return resp
+	}
 
 	content := planned.GetAttr("content")
 	var key []byte
