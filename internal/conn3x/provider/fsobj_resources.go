@@ -153,15 +153,17 @@ func linkSchema() providers.Schema {
 			"id":        {Type: cty.String, Computed: true},
 			"revision":  revisionAttr(),
 			"path":      {Type: cty.String, Required: true, Description: "Absolute path of the link."},
-			"target":    {Type: cty.String, Required: true, Description: "What the link points to, absolute or relative to the link."},
+			"target":    {Type: cty.String, Optional: true, Description: "What the link points to, absolute or relative to the link. Required unless state is \"absent\"."},
 			"on_remove": {Type: cty.String, Optional: true, Computed: true, Description: "\"forget\" (default) leaves the link, \"delete\" removes it."},
+			"state":     {Type: cty.String, Optional: true, Description: "\"present\" (default) or \"absent\", which removes the link and keeps it gone."},
+			"in_sync":   {Type: cty.Bool, Computed: true, Description: "With state \"absent\", whether the link is already gone. Null otherwise."},
 		},
 		BlockTypes: map[string]*configschema.NestedBlock{"ssh": connectionBlock()},
 	}}
 }
 
 func linkFrom(v cty.Value) fsobj.Link {
-	return fsobj.Link{Path: v.GetAttr("path").AsString(), Target: v.GetAttr("target").AsString()}
+	return fsobj.Link{Path: v.GetAttr("path").AsString(), Target: stringOr(v.GetAttr("target"), "")}
 }
 
 func validateLink(cfg cty.Value) tfdiags.Diagnostics {
@@ -170,19 +172,45 @@ func validateLink(cfg cty.Value) tfdiags.Diagnostics {
 		return diags
 	}
 	diags = diags.Append(validateOnRemove(cfg))
-	if err := linkFrom(cfg).Validate(); err != nil {
-		diags = diags.Append(attrError("path", err.Error()))
+	diags = diags.Append(validateState(cfg, "target"))
+	l := linkFrom(cfg)
+	switch {
+	case !cfg.GetAttr("state").IsKnown() || isAbsent(cfg):
+		// Without a target, only the path is left to check.
+		if err := (file.Desired{Path: l.Path, Mode: defaultMode}).Validate(); err != nil {
+			diags = diags.Append(attrError("path", err.Error()))
+		}
+	case cfg.GetAttr("target").IsNull():
+		diags = diags.Append(attrError("target", fmt.Sprintf("target is required unless state is %q", stateAbsent)))
+	default:
+		if err := l.Validate(); err != nil {
+			diags = diags.Append(attrError("path", err.Error()))
+		}
 	}
 	return diags
 }
 
 func planLink(req providers.PlanResourceChangeRequest) providers.PlanResourceChangeResponse {
-	return planPathResource(req, "link", func(map[string]cty.Value) {})
+	return planPathResource(req, "link", func(vals map[string]cty.Value) {
+		switch {
+		case !vals["state"].IsKnown():
+			vals["in_sync"] = cty.UnknownVal(cty.Bool)
+		case isAbsent(req.ProposedNewState):
+			vals["in_sync"] = absentInSync(req)
+		default:
+			vals["in_sync"] = cty.NullVal(cty.Bool)
+		}
+	})
 }
 
 func readLink(ctx context.Context, req providers.ReadResourceRequest) providers.ReadResourceResponse {
 	return readPathResource(ctx, req, func(ctx context.Context, h *hostConn, prior cty.Value) (cty.Value, error) {
 		s, err := fsobj.ReadLink(ctx, h, prior.GetAttr("path").AsString())
+		if err == nil && isAbsent(prior) {
+			vals := prior.AsValueMap()
+			vals["in_sync"] = cty.BoolVal(!s.Exists)
+			return cty.ObjectVal(vals), nil
+		}
 		if err != nil || !s.Exists {
 			return cty.NullVal(prior.Type()), err
 		}
@@ -195,6 +223,9 @@ func readLink(ctx context.Context, req providers.ReadResourceRequest) providers.
 func applyLink(ctx context.Context, req providers.ApplyResourceChangeRequest) providers.ApplyResourceChangeResponse {
 	return applyPathResource(ctx, req,
 		func(ctx context.Context, h *hostConn, planned cty.Value) (cty.Value, error) {
+			if isAbsent(planned) {
+				return removeLink(ctx, h, planned)
+			}
 			l := linkFrom(planned)
 			if err := fsobj.ApplyLink(ctx, h, l); err != nil {
 				return cty.NilVal, fmt.Errorf("link %s: %w", l.Path, err)
@@ -204,6 +235,19 @@ func applyLink(ctx context.Context, req providers.ApplyResourceChangeRequest) pr
 		func(ctx context.Context, h *hostConn, prior cty.Value) error {
 			return fsobj.DeleteLink(ctx, h, prior.GetAttr("path").AsString())
 		})
+}
+
+// removeLink removes the link for state = "absent". DeleteLink refuses
+// anything at the path that isn't a link, and removes only the link, never
+// what it points to.
+func removeLink(ctx context.Context, h *hostConn, planned cty.Value) (cty.Value, error) {
+	p := planned.GetAttr("path").AsString()
+	if err := fsobj.DeleteLink(ctx, h, p); err != nil {
+		return cty.NilVal, fmt.Errorf("removing %s: %w", p, err)
+	}
+	vals := planned.AsValueMap()
+	vals["in_sync"] = cty.True
+	return cty.ObjectVal(vals), nil
 }
 
 // planPathResource is the plan logic shared by resources keyed by a path:

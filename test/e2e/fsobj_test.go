@@ -97,3 +97,56 @@ func TestDirectoryAbsent(t *testing.T) {
 		t.Fatalf("plan for a missing path is not empty:\n%s", out)
 	}
 }
+
+func TestLinkAbsent(t *testing.T) {
+	h := startHost(t, "rocky10")
+	h.exec("", "ln", "-s", "/usr/bin/true", "/usr/local/bin/app-legacy")
+	vars := fsobjVars{Port: h.port, KeyFile: h.keyFile, KnownHosts: h.knownHosts}
+	w := newWorkdir(t, "link_absent")
+	w.write(vars)
+	w.mustConn3x("init", "-no-color")
+
+	w.mustConn3x("apply", "-auto-approve", "-no-color")
+	if got := h.exec("", "sh", "-c", "test -L /usr/local/bin/app-legacy && echo present || echo gone"); got != "gone\n" {
+		t.Fatalf("/usr/local/bin/app-legacy after apply: %s", got)
+	}
+	if got := h.exec("", "sh", "-c", "test -x /usr/bin/true && echo kept"); got != "kept\n" {
+		t.Fatalf("the link's target after apply: %q", got)
+	}
+	if out := w.mustConn3x("plan", "-no-color"); !strings.Contains(out, "No changes.") {
+		t.Fatalf("second plan is not empty:\n%s", out)
+	}
+
+	// A link that comes back is out of sync, and apply removes it again.
+	h.exec("", "ln", "-s", "/usr/bin/false", "/usr/local/bin/app-legacy")
+	out := w.mustConn3x("plan", "-no-color")
+	for _, want := range []string{`~ resource "conn3x_link" "legacy"`, "1 to change"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("plan missing %q:\n%s", want, out)
+		}
+	}
+	w.mustConn3x("apply", "-auto-approve", "-no-color")
+	if out := w.mustConn3x("plan", "-no-color"); !strings.Contains(out, "No changes.") {
+		t.Fatalf("plan after removing it again is not empty:\n%s", out)
+	}
+
+	// A regular file at the path is refused and left in place.
+	h.exec("", "sh", "-c", "echo keep > /usr/local/bin/app-legacy")
+	if out, code := w.conn3x("plan", "-no-color"); code == 0 || !strings.Contains(out, "not a symlink") {
+		t.Fatalf("plan over a regular file exited %d:\n%s", code, out)
+	}
+	if got := h.exec("", "cat", "/usr/local/bin/app-legacy"); got != "keep\n" {
+		t.Fatalf("file after the refused plan: %q", got)
+	}
+	h.exec("", "rm", "/usr/local/bin/app-legacy")
+
+	// Starting from empty state with the path already missing, apply
+	// succeeds and the next plan is clean.
+	w = newWorkdir(t, "link_absent")
+	w.write(vars)
+	w.mustConn3x("init", "-no-color")
+	w.mustConn3x("apply", "-auto-approve", "-no-color")
+	if out := w.mustConn3x("plan", "-no-color"); !strings.Contains(out, "No changes.") {
+		t.Fatalf("plan for a missing path is not empty:\n%s", out)
+	}
+}
