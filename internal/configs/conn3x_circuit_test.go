@@ -413,6 +413,7 @@ circuit "web" {
       destination = "/etc/nginx/nginx.conf"
       vars        = { server_name = each.key }
       mode        = "0640"
+      validate    = "nginx -t -c %s"
     }
   }
   step "motd" {
@@ -432,7 +433,7 @@ circuit "web" {
 		t.Fatalf("no conn3x_file.web__nginx_conf; have %v", keys(mod.ManagedResources))
 	}
 	content, diags := r.Config.Content(&hcl.BodySchema{
-		Attributes: []hcl.AttributeSchema{{Name: "path", Required: true}, {Name: "content", Required: true}, {Name: "mode"}},
+		Attributes: []hcl.AttributeSchema{{Name: "path", Required: true}, {Name: "content", Required: true}, {Name: "mode"}, {Name: "validate"}},
 		Blocks:     []hcl.BlockHeaderSchema{{Type: "ssh"}},
 	})
 	if diags.HasErrors() {
@@ -444,6 +445,9 @@ circuit "web" {
 	}
 	if _, ok := content.Attributes["mode"]; !ok {
 		t.Fatal("mode not carried over")
+	}
+	if _, ok := content.Attributes["validate"]; !ok {
+		t.Fatal("validate not carried over")
 	}
 
 	motd := mod.ManagedResources["conn3x_file.web__motd"]
