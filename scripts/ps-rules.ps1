@@ -20,7 +20,8 @@ $readImports = 'CimCmdlets', 'Microsoft.PowerShell.LocalAccounts', 'NetSecurity'
 # Types and methods together: a name alone would pass [IO.File]::Replace for
 # [BitConverter]'s text, or [IO.File]::Create for [SHA256]::Create.
 $readStatic = 'BitConverter::GetBytes', 'BitConverter::ToString', 'BitConverter::ToUInt32', 'BitConverter::ToUInt64', 'Convert::ToBase64String',
-  'IO.Path::GetDirectoryName', 'Security.Cryptography.SHA256::Create', 'Security.Principal.SecurityIdentifier::new', 'Security.Principal.WindowsIdentity::GetCurrent',
+  'IO.Path::GetDirectoryName', 'Microsoft.Web.Administration.ServerManager::new', 'Reflection.Assembly::Load',
+  'Security.Cryptography.SHA256::Create', 'Security.Principal.SecurityIdentifier::new', 'Security.Principal.WindowsIdentity::GetCurrent',
   'string::Join'
 $readInstance = 'Close', 'ComputeHash', 'GetAccessRules', 'GetBytes', 'GetOwner', 'GetType', 'GetValue', 'GetValueKind', 'Invoke', 'InvokeMember', 'IsInRole', 'OpenSubKey',
   'Replace', 'ToLowerInvariant', 'ToString', 'Translate'
@@ -40,6 +41,10 @@ foreach ($file in $Files) {
   $tree = [Management.Automation.Language.Parser]::ParseFile((Resolve-Path -LiteralPath $file), [ref]$null, [ref]$errors)
   foreach ($e in $errors) { Write-Output "$($file): parse error: $($e.Message)"; $failed++ }
   $isRead = (Split-Path -Leaf $file) -like 'read_*'
+  # Both load a DLL as the script is parsed, before any rule below could matter.
+  # pwsh 7 no longer parses #Requires -Assemblies, which 5.1 on the host still
+  # honours, so it's matched as text.
+  if ($isRead -and (Get-Content -LiteralPath $file -Raw) -imatch '(?m)^\s*#requires\b.*\s-a') { Report $file $tree 'a read script may not load an assembly with #Requires -Assemblies' }
   $all = $tree.FindAll({ $true }, $true)
   # A read may fill in a table it made itself, and set nothing else's properties.
   $tables = @{}
@@ -99,6 +104,10 @@ foreach ($file in $Files) {
           if ($a.Static) {
             $type = if ($a.Expression -is [Management.Automation.Language.TypeExpressionAst]) { $a.Expression.TypeName.FullName } else { $who }
             if ("${type}::$m" -notin $readStatic) { Report $file $a "${type}::$m isn't on the list for read scripts" }
+            # Loading an assembly runs its initialisers: only the IIS one, by its full name.
+            elseif ("${type}::$m" -eq 'Reflection.Assembly::Load' -and ($a.Arguments.Count -ne 1 -or $a.Arguments[0].Extent.Text -cne "'Microsoft.Web.Administration, Version=7.0.0.0, Culture=neutral, PublicKeyToken=31bf3856ad364e35'")) { Report $file $a 'a read script may load only Microsoft.Web.Administration, by its full name' }
+            # Opened any other way, a ServerManager can commit changes to IIS.
+            elseif ("${type}::$m" -eq 'Microsoft.Web.Administration.ServerManager::new' -and ($a.Arguments.Count -ne 2 -or $a.Arguments[0].Extent.Text -ine '$true')) { Report $file $a 'ServerManager in a read script must be opened read-only, with $true first' }
           }
           elseif ($m -notin $readInstance) { Report $file $a "method $m isn't on the list for read scripts" }
           # FileInfo has a Replace, and a registry key opens for writing.
@@ -117,6 +126,9 @@ foreach ($file in $Files) {
       }
       'FileRedirectionAst' {
         if ($isRead -and $a.Location.Extent.Text -notin '$null') { Report $file $a 'a read script may not write to a file' }
+      }
+      'UsingStatementAst' {
+        if ($isRead -and $a.UsingStatementKind -eq 'Assembly') { Report $file $a 'a read script may not load an assembly with using assembly' }
       }
       'StringConstantExpressionAst' {
         if ($isRead -and $a.Value -imatch $bannedText) { Report $file $a "$bannedText can trigger an MSI repair" }
