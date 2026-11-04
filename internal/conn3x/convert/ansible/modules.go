@@ -267,6 +267,8 @@ var modules = map[string]func(*input) ([]step, string){
 	"win_acl_inheritance":  winACLInheritanceModule,
 	"win_command":          winCommandModule,
 	"win_copy":             winCopyModule,
+	"win_dns_client":       winDNSClientModule,
+	"win_domain":           winDomainModule,
 	"win_feature":          winFeatureModule,
 	"win_file":             winFileModule,
 	"win_firewall_rule":    winFirewallRuleModule,
@@ -287,7 +289,17 @@ var modules = map[string]func(*input) ([]step, string){
 	// microsoft.iis, which replaces the community.windows IIS modules.
 	"web_app_pool": winIISAppPoolModule,
 	"website":      winWebsiteModule,
+	// microsoft.ad, which replaces win_domain and its kin. By its full name,
+	// as plenty of collections have a module called domain.
+	"microsoft.ad.domain": winDomainModule,
 }
+
+// exact lists the modules matched by their full name only.
+var exact = map[string]bool{"microsoft.ad.domain": true}
+
+// fullNameOnly lists collections whose modules are matched only by their full
+// name, as listed in exact: microsoft.ad.user is no Linux user.
+var fullNameOnly = []string{"microsoft.ad."}
 
 func copyModule(in *input) ([]step, string) {
 	attrs := []attr{s("path", in.str("dest"))}

@@ -66,6 +66,12 @@ func TestWindowsMappings(t *testing.T) {
 		`community.windows.win_firewall_rule: {name: HTTPS in, localport: 443, protocol: tcp, action: allow, direction: in, state: present, enabled: yes}`: {
 			"windows_firewall_rule {", `name        = "HTTPS in"`, `local_ports = ["443"]`, `protocol    = "tcp"`, "enabled     = true",
 		},
+		`microsoft.ad.domain: {dns_domain_name: lab.example.com, domain_netbios_name: LAB, safe_mode_password: '{{ dsrm }}', database_path: 'F:\NTDS', reboot: true, reboot_timeout: 900}`: {
+			"windows_ad_forest {", `domain_name   = "lab.example.com"`, `netbios_name  = "LAB"`, `database_path = "F:\\NTDS"`, "TODO(convert): Set safe_mode_password_wo",
+			"windows_reboot {", `timeout         = "900s"`, "windows_wait_for {", "port = 9389",
+		},
+		`ansible.windows.win_domain: {dns_domain_name: lab.example.com, safe_mode_password: x}`: {"windows_ad_forest {"},
+		`win_dns_client: {adapter_names: Ethernet, dns_servers: [10.0.0.4, 10.0.0.5]}`:          {"windows_dns_client {", `interface = "Ethernet"`, `servers   = ["10.0.0.4", "10.0.0.5"]`},
 		`win_firewall_rule: {name: SQL, localport: '1433,1434', remoteip: '10.0.0.0/8', protocol: tcp, profiles: [Domain, Private], direction: out, action: block}`: {
 			`local_ports      = ["1433", "1434"]`, `remote_addresses = ["10.0.0.0/8"]`, `profiles         = ["domain", "private"]`, `direction        = "outbound"`, `action           = "block"`,
 		},
@@ -123,6 +129,12 @@ func TestWindowsLeftForAPerson(t *testing.T) {
 		"bindings.set":                `website: {name: a, physical_path: 'C:\x', bindings: {add: [{port: 80}]}}`,
 		"can't take":                  `win_firewall_rule: {name: 'a*b', localport: 80, protocol: tcp}`,
 		"sets program":                `win_firewall_rule: {name: a, program: 'C:\x.exe'}`,
+		"without DNS":                 `microsoft.ad.domain: {dns_domain_name: lab.test, safe_mode_password: x, install_dns: false}`,
+		"sets forest_mode":            `microsoft.ad.domain: {dns_domain_name: lab.test, safe_mode_password: x, forest_mode: WinThreshold}`,
+		"all of them":                 `win_dns_client: {adapter_names: '*', dns_servers: [10.0.0.4]}`,
+		"resets DNS to DHCP":          `win_dns_client: {adapter_names: Ethernet, dns_servers: []}`,
+		"the domain module":           `community.example.domain: {dns_domain_name: lab.test}`,
+		"uses the domain module":      `domain: {dns_domain_name: lab.test}`,
 		"win_updates module":          `win_updates: {category_names: [SecurityUpdates]}`,
 		"win_chocolatey module":       `win_chocolatey: {name: git}`,
 		"win_dsc module":              `win_dsc: {resource_name: x}`,
@@ -156,5 +168,53 @@ func TestWinScheduledTaskPasswordNotCopied(t *testing.T) {
 	res := convertString(t, "- hosts: all\n  tasks:\n    - win_scheduled_task: {name: a, username: 'LAB\\svc', password: "+secret+", logon_type: password, actions: [{path: 'C:\\a.exe'}]}\n")
 	if res.Converted != 1 || strings.Contains(string(res.HCL), secret) || !strings.Contains(string(res.HCL), "password_wo") {
 		t.Errorf("converted %d, review %+v:\n%s", res.Converted, res.Review, res.HCL)
+	}
+}
+
+// A task left for a person is echoed into the file, so its secrets are left
+// out of the echo, wherever they sit.
+func TestRefusedTasksDontEchoSecrets(t *testing.T) {
+	const secret = "s3ntinel-Dsrm-9Q"
+	for _, task := range []string{
+		`microsoft.ad.domain: {dns_domain_name: lab.test, safe_mode_password: ` + secret + `, install_dns: false}`,
+		`microsoft.ad.domain: {dns_domain_name: lab.test, safe_mode_password: ` + secret + `, forest_mode: WinThreshold}`,
+		`microsoft.ad.domain: {dns_domain_name: lab.test, safe_mode_password: ` + secret + `, reboot: true, reboot_timeout: soon}`,
+		`microsoft.ad.domain: {dns_domain_name: lab.test, safe_mode_password: ` + secret + `, reboot: true, reboot_timeout: 0}`,
+		`microsoft.ad.domain: {dns_domain_name: lab.test, safe_mode_password: ` + secret + `, some_new_option: x}`,
+		`win_domain: {dns_domain_name: lab.test, safe_mode_password: ` + secret + `, install_dns: no}`,
+		`microsoft.ad.domain: {dns_domain_name: lab.test, dns_delegation_credential: {username: a, password: ` + secret + `}}`,
+		`microsoft.ad.user: {name: alice, password: ` + secret + `}`,
+		`community.windows.win_domain_user: {name: alice, Password: ` + secret + `, api_token: ` + secret + `x}`,
+		"microsoft.ad.domain:\n        dns_domain_name: lab.test\n        install_dns: false\n      args:\n        safe_mode_password: " + secret,
+		`microsoft.ad.domain: dns_domain_name=lab.test safe_mode_password=` + secret + ` install_dns=false`,
+		`win_user: name=bob password="` + secret + ` with spaces" groups=x unknown_opt=1`,
+		`win_user: name=bob password='` + secret + `' groups=x`,
+	} {
+		res := convertString(t, "- hosts: all\n  tasks:\n    - "+task+"\n")
+		if len(res.Review) != 1 || strings.Contains(string(res.HCL), secret) || !strings.Contains(string(res.HCL), "secret left out") {
+			t.Errorf("%s: review %+v\n%s", task, res.Review, res.HCL)
+		}
+	}
+}
+
+// An anchor could carry a secret's value to the place it's defined, which the
+// redaction doesn't see, so a task with any is echoed not at all.
+func TestRefusedTasksWithAnchorsAreNotEchoed(t *testing.T) {
+	const secret = "s3ntinel-Anchor-9Q"
+	task := `microsoft.ad.domain: {dns_domain_name: lab.test, x: &p ` + secret + `, safe_mode_password: *p, install_dns: false}`
+	res := convertString(t, "- hosts: all\n  tasks:\n    - "+task+"\n")
+	if len(res.Review) != 1 || strings.Contains(string(res.HCL), secret) || !strings.Contains(string(res.HCL), "anchors or aliases") {
+		t.Errorf("review %+v\n%s", res.Review, res.HCL)
+	}
+}
+
+// Only the microsoft.ad modules listed by full name convert; the rest aren't
+// the Linux modules that share their last name.
+func TestMicrosoftADOnlyByFullName(t *testing.T) {
+	for _, task := range []string{`microsoft.ad.user: {name: alice}`, `microsoft.ad.group: {name: admins, scope: global}`} {
+		res := convertString(t, "- hosts: all\n  tasks:\n    - "+task+"\n")
+		if res.Converted != 0 || len(res.Review) != 1 || !strings.Contains(res.Review[0].Reason, "microsoft.ad.") {
+			t.Errorf("%s: converted %d, review %+v", task, res.Converted, res.Review)
+		}
 	}
 }
