@@ -155,3 +155,117 @@ func TestConvertPlayRolesWaitsForHandlers(t *testing.T) {
 		t.Errorf("the handler is listed %d times: %+v", odd, res.Review)
 	}
 }
+
+// convertWithMeta is convertPlay with each role given a meta/main.yml.
+func convertWithMeta(t *testing.T, play string, meta map[string]string) Result {
+	t.Helper()
+	dir := t.TempDir()
+	for name, m := range meta {
+		if err := os.CopyFS(filepath.Join(dir, "roles", name), os.DirFS(filepath.Join("testdata", "playroles", "roles", "web"))); err != nil {
+			t.Fatal(err)
+		}
+		if m == "" {
+			continue
+		}
+		if err := os.MkdirAll(filepath.Join(dir, "roles", name, "meta"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "roles", name, "meta", "main.yml"), []byte(m), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "p.yml"), []byte(play), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, err := ConvertWith(filepath.Join(dir, "p.yml"), Options{Roles: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return res
+}
+
+// A role's meta/ dependencies run before it, each as its own module with
+// the vars meta/ passes, and a dependency the play already ran with the
+// same vars runs once.
+func TestConvertPlayRolesDependencies(t *testing.T) {
+	res := convertWithMeta(t, "- hosts: web\n  roles:\n    - common\n    - app\n    - db\n", map[string]string{
+		"common": "",
+		"app":    "dependencies:\n  - common\n",
+		"db":     "dependencies:\n  - role: common\n    web_port: 81\n",
+	})
+	hcl := string(res.HCL)
+	order := []string{`module "common" {`, `module "app" {`, "depends_on = [module.common]", `module "common_2" {`, "web_port = 81", "depends_on = [module.app]", `module "db" {`, "depends_on = [module.common_2]"}
+	at := 0
+	for _, s := range order {
+		i := strings.Index(hcl[at:], s)
+		if i < 0 {
+			t.Fatalf("%q missing or out of order:\n%s", s, hcl)
+		}
+		at += i
+	}
+	if strings.Count(hcl, "module \"") != 4 || len(res.Review) != 0 {
+		t.Errorf("review %+v:\n%s", res.Review, hcl)
+	}
+	if strings.Contains(string(res.Files["circuit-app/main.circuit.hcl"]), "dependencies") {
+		t.Errorf("circuit-app still says to convert its dependencies:\n%s", res.Files["circuit-app/main.circuit.hcl"])
+	}
+}
+
+// A dependency that can't convert, or a role that depends on itself, keeps
+// the call for review.
+func TestConvertPlayRolesDependenciesRefused(t *testing.T) {
+	for want, meta := range map[string]map[string]string{
+		"whose dependency can't convert: it runs the role gone": {"app": "dependencies:\n  - gone\n"},
+		"depends on itself": {"app": "dependencies:\n  - b\n", "b": "dependencies:\n  - app\n"},
+	} {
+		res := convertWithMeta(t, "- hosts: web\n  roles:\n    - app\n", meta)
+		if strings.Contains(string(res.HCL), "module ") || len(res.Review) == 0 || !strings.Contains(res.Review[0].Reason, want) {
+			t.Errorf("%s: review %+v\n%s", want, res.Review, res.HCL)
+		}
+	}
+}
+
+// A role whose meta/ sets allow_duplicates runs each time it's listed, and
+// two calls that pass different lists aren't the same call.
+func TestConvertPlayRolesRunsAgain(t *testing.T) {
+	res := convertWithMeta(t, "- hosts: web\n  roles:\n    - common\n    - common\n    - role: web\n      vars:\n        ports: [80]\n    - role: web\n      vars:\n        ports: [443]\n", map[string]string{
+		"common": "allow_duplicates: true\n",
+		"web":    "",
+	})
+	hcl := string(res.HCL)
+	if strings.Count(hcl, `source = "./circuit-common"`) != 2 || strings.Count(hcl, `source = "./circuit-web"`) != 2 {
+		t.Errorf("runs:\n%s", hcl)
+	}
+}
+
+// What a dependency in meta/ passes is reported against meta/, and a
+// dependency of a role that can't be called isn't written.
+func TestConvertPlayRolesDependencyFiles(t *testing.T) {
+	res := convertWithMeta(t, "- hosts: web\n  roles:\n    - app\n    - db\n", map[string]string{
+		"common": "",
+		"app":    "dependencies:\n  - role: common\n    vars:\n      web_port: \"{{ p }}\"\n",
+		"db":     "dependencies:\n  - other\n  - gone\n",
+		"other":  "",
+	})
+	if len(res.Review) != 2 || res.Review[0].File != "roles/app/meta/main.yml" || !strings.Contains(res.Review[1].Reason, "runs the role gone") {
+		t.Errorf("review: %+v", res.Review)
+	}
+	if res.Files["circuit-other/main.circuit.hcl"] != nil || res.Files["circuit-common/main.circuit.hcl"] == nil {
+		t.Errorf("files: %v", len(res.Files))
+	}
+}
+
+// A role beside the playbook, not in roles/, is found as Ansible finds it.
+func TestConvertPlayRolesBesideThePlaybook(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.CopyFS(filepath.Join(dir, "web"), os.DirFS(filepath.Join("testdata", "playroles", "roles", "web"))); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "p.yml"), []byte("- hosts: web\n  roles:\n    - web\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, err := ConvertWith(filepath.Join(dir, "p.yml"), Options{Roles: true})
+	if err != nil || len(res.Review) != 0 || !strings.Contains(string(res.HCL), `module "web"`) {
+		t.Fatalf("%v %+v\n%s", err, res.Review, res.HCL)
+	}
+}

@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 
@@ -74,7 +75,7 @@ func ConvertWith(path string, opts Options) (Result, error) {
 		return Result{}, fmt.Errorf("%s: a playbook is a list of plays", path)
 	}
 	c := &converter{dir: filepath.Dir(path), file: filepath.Base(path), inv: opts.Inventory, roleCalls: opts.Roles,
-		roles: map[string]*convertedRole{}, roleDirs: map[string]int{}, modules: map[string]int{}, callWhy: map[*yaml.Node]string{}}
+		roles: map[string]*convertedRole{}, roleDirs: map[string]int{}, converting: map[string]bool{}, called: map[string]bool{}, modules: map[string]int{}, callWhy: map[*yaml.Node]string{}}
 	return c.run(doc.Content[0]), nil
 }
 
@@ -91,12 +92,19 @@ type converter struct {
 	modules   map[string]int
 	callWhy   map[*yaml.Node]string
 	factsTail bool // a later part of the play, split around a role call, reads facts
-	res       Result
-	hostVars  map[string]bool // groups that still need a hosts variable
-	needUser  bool
-	playNoLog bool   // the current play sets no_log to anything but false
-	runAs     string // who the current play's tasks run as, as an expression; empty when it's open
-	otherUser string // what in the current play makes Ansible run as someone a circuit wouldn't
+	// ran are the roles the current play has called by its roles list or
+	// as a dependency, which Ansible runs once each; converting holds
+	// those being converted, to catch a role that depends on itself.
+	ran        map[string]bool
+	converting map[string]bool
+	called     map[string]bool // role directories a module calls
+	depsCalled bool            // set on a role's converter when its caller calls its dependencies
+	res        Result
+	hostVars   map[string]bool // groups that still need a hosts variable
+	needUser   bool
+	playNoLog  bool   // the current play sets no_log to anything but false
+	runAs      string // who the current play's tasks run as, as an expression; empty when it's open
+	otherUser  string // what in the current play makes Ansible run as someone a circuit wouldn't
 	// factsAfter marks the current play's tasks that a later task or handler
 	// reads facts after.
 	factsAfter map[*yaml.Node]bool
@@ -148,6 +156,21 @@ func (c *converter) run(plays *yaml.Node) Result {
 		}
 	}
 	c.res.HCL = hclwrite.Format(f.Bytes())
+	// A dependency converted for a role that then couldn't be called has no
+	// module calling it, so neither it nor what it left for review is kept.
+	for _, r := range c.roles {
+		if c.called[r.dir] {
+			continue
+		}
+		for p := range c.res.Files {
+			if strings.HasPrefix(p, r.dir+"/") {
+				delete(c.res.Files, p)
+			}
+		}
+		c.res.Review = slices.DeleteFunc(c.res.Review, func(i Issue) bool { return strings.HasPrefix(i.File, r.from) })
+		c.res.Notes = slices.DeleteFunc(c.res.Notes, func(i Issue) bool { return strings.HasPrefix(i.File, r.from) })
+		c.res.Converted -= r.converted
+	}
 	return c.res
 }
 
@@ -185,6 +208,7 @@ func (c *converter) login(circuit, ssh *hclwrite.Body, play string, node *yaml.N
 // play turns one play into a circuit.
 func (c *converter) play(name, hosts string, p map[string]*yaml.Node, node *yaml.Node, used map[string]int) []*hclwrite.Block {
 	review := len(c.res.Review)
+	c.ran = map[string]bool{}
 	n := noLogOf(node)
 	c.playNoLog = n != nil && !noLogOff(n)
 	circuit := hclwrite.NewBlock("circuit", []string{name})
@@ -254,8 +278,9 @@ func (c *converter) play(name, hosts string, p map[string]*yaml.Node, node *yaml
 			if i == 0 && commented {
 				blocks = append(blocks, circuit)
 			}
-			blocks = append(blocks, c.module(seg.call, cb, mapping(p["vars"]), after))
-			after = "module." + blocks[len(blocks)-1].Labels()[0]
+			mods, a := c.calls(seg.call, cb, mapping(p["vars"]), after)
+			blocks = append(blocks, mods...)
+			after = a
 			continue
 		}
 		next := circuit
