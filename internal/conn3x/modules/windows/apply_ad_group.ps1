@@ -16,8 +16,13 @@ if ($A.create) {
   # Taking the login out of a group it gets its rights through, such as Domain
   # Admins, could lock Conn3x out, so none of its own SIDs is removed.
   if ($mine -contains $g.SID.Value) {
-    foreach ($m in @($A.remove)) {
-      if ($m -and $mine -contains (Get-ADObject -Identity ([string]$m) -Properties objectSid).objectSid.Value) { throw "this would take $m out of $($g.Name), and the login Conn3x uses gets its rights through it; that could lock Conn3x out" }
+    $sids = @($A.remove_sids)
+    for ($i = 0; $i -lt $sids.Count; $i++) {
+      # Without a SID from the read, ask the global catalog, so the guard fails
+      # closed: a member AD can't find stops the apply here.
+      $sid = [string]$sids[$i]
+      if (-not $sid) { $sid = [string](Get-ADObject -Server 'localhost:3268' -Identity ([string]@($A.remove)[$i]) -Properties objectSid).objectSid.Value }
+      if ($sid -and $mine -contains $sid) { throw "this would take $(@($A.remove)[$i]) out of $($g.Name), and the login Conn3x uses gets its rights through it; that could lock Conn3x out" }
     }
   }
   if ($A.scope -and [string]$g.GroupScope -ne $A.scope) {
@@ -31,5 +36,18 @@ if ($A.create) {
 }
 $add = @(@($A.add) | Where-Object { $_ } | ForEach-Object { [string]$_ })
 $remove = @(@($A.remove) | Where-Object { $_ } | ForEach-Object { [string]$_ })
-if ($add.Count) { Add-ADGroupMember -Identity $dn -Members $add }
-if ($remove.Count) { Remove-ADGroupMember -Identity $dn -Members $remove -Confirm:$false }
+if ($add.Count -or $remove.Count) {
+  # Straight to this DC over LDAP, bound by GUID so the DN needs no escaping.
+  # A member added as <SID=...> may be in another domain of the forest, or in
+  # one it trusts, where AD makes the foreign security principal itself. The
+  # AD cmdlets look each member up in this domain only.
+  $guid = (Get-ADGroup -Identity $dn).ObjectGUID
+  $de = [adsi]"LDAP://localhost/<GUID=$guid>"
+  try {
+    # 3 appends values and 4 deletes them, without reading the whole list,
+    # a thousand to a write so a big group's request stays small. Slices,
+    # not Select-Object: COM can't take the wrapped strings that returns.
+    for ($i = 0; $i -lt $add.Count; $i += 1000) { $de.PutEx(3, 'member', [object[]]$add[$i..([Math]::Min($i + 999, $add.Count - 1))]); $de.SetInfo() }
+    for ($i = 0; $i -lt $remove.Count; $i += 1000) { $de.PutEx(4, 'member', [object[]]$remove[$i..([Math]::Min($i + 999, $remove.Count - 1))]); $de.SetInfo() }
+  } finally { $de.psbase.Dispose() }
+}
