@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/hashicorp/hcl/v2"
@@ -25,6 +26,7 @@ import (
 	"github.com/opentofu/opentofu/internal/configs/configschema"
 	"github.com/opentofu/opentofu/internal/conn3x/importid"
 	"github.com/opentofu/opentofu/internal/conn3x/provider"
+	"github.com/opentofu/opentofu/internal/conn3x/termsafe"
 )
 
 // maxContent is the largest file content generate prints; past it, or when
@@ -55,7 +57,7 @@ Name the module and the arguments that identify the object, as in:
 
 Values are read as HCL where they parse, such as uid=1000 or groups=["ops"], and as strings otherwise.
 
-A file's content is printed as it is, unless it isn't UTF-8 or is over 64 KiB: then the step gets content_wo with a placeholder for you to fill in. With -write-only it always does, and the content never leaves the host.
+A file's content is printed as it is, unless it isn't UTF-8 or is over 64 KiB: then the step gets content_wo with a placeholder for you to fill in. With -write-only it always does. The file is still read to this machine, as every file step's read does, but its content is never printed or stored.
 
 The modules a step can import can be generated. For those whose reads only say whether the host matches, such as cron, sysctl and the firewall rules, the step holds the arguments you give, once the host is shown to have the object.
 
@@ -71,7 +73,7 @@ The host is checked against known_hosts (~/.ssh/known_hosts unless -known-hosts-
 	step.CommandLine.StringVar(&o.knownHosts, "known-hosts-file", "", "known_hosts file to check the host against. Defaults to ~/.ssh/known_hosts.")
 	step.CommandLine.BoolVar(&o.become, "become", false, "Read as root through sudo, as become in a circuit's ssh block.")
 	step.CommandLine.StringVar(&o.name, "name", "", "The step's name. Defaults to one made from the object, such as etc_motd.")
-	step.CommandLine.BoolVar(&o.writeOnly, "write-only", false, "For a file: print content_wo with a placeholder, and keep the content on the host.")
+	step.CommandLine.BoolVar(&o.writeOnly, "write-only", false, "For a file: print content_wo with a placeholder, and keep the content out of the output.")
 	step.Run = func(command.Meta) int {
 		return runGenerateStep(context.Background(), o, stdout, os.Stderr)
 	}
@@ -97,7 +99,8 @@ var generateSkip = map[string]bool{"id": true, "revision": true, "in_sync": true
 
 func runGenerateStep(ctx context.Context, o generateOptions, stdout, stderr io.Writer) int {
 	fail := func(format string, a ...any) int {
-		fmt.Fprintf(stderr, "Error: "+format+"\n", a...)
+		// An error can quote what the host printed.
+		fmt.Fprintln(stderr, termsafe.Escape(fmt.Sprintf("Error: "+format, a...)))
 		return 1
 	}
 	if o.host == "" {
@@ -265,14 +268,15 @@ func renderStep(name, module string, block *configschema.Block, state cty.Value,
 	return f.Bytes()
 }
 
-// renderContent prints a file's content: as a heredoc when it's text that
-// ends in a newline, quoted when it's short text without one, and as
+// renderContent prints a file's content: as a heredoc when it's plain text
+// that ends in a newline, quoted when it has no final newline or has
+// characters a terminal wouldn't show, and as
 // content_wo with a placeholder when it's write-only, not UTF-8, or large.
 func renderContent(body *hclwrite.Body, content cty.Value, writeOnly bool) {
 	var why string
 	switch {
 	case writeOnly:
-		why = "write-only: the content stayed on the host"
+		why = "write-only: the content was left out"
 	case content.IsNull() || !content.IsKnown():
 		return
 	case !utf8.ValidString(content.AsString()):
@@ -288,7 +292,7 @@ func renderContent(body *hclwrite.Body, content cty.Value, writeOnly bool) {
 		return
 	}
 	text := content.AsString()
-	if !strings.HasSuffix(text, "\n") || hasLine(text, "EOT") {
+	if !strings.HasSuffix(text, "\n") || hasLine(text, "EOT") || !plainText(text) {
 		body.SetAttributeValue("content", content)
 		return
 	}
@@ -299,6 +303,20 @@ func renderContent(body *hclwrite.Body, content cty.Value, writeOnly bool) {
 		{Type: hclsyntax.TokenStringLit, Bytes: []byte(escaped)},
 		{Type: hclsyntax.TokenCHeredoc, Bytes: []byte("EOT")},
 	})
+}
+
+// plainText reports whether every character of text is printable, a
+// newline or a tab. A terminal hides anything else, such as an escape
+// sequence, and leaves it out of copied text, so "$<escape>{" would paste
+// as a live "${" and "EO<escape>T" as the heredoc's end. The quoted form
+// writes such characters as \u escapes.
+func plainText(text string) bool {
+	for _, r := range text {
+		if r != '\n' && r != '\t' && !unicode.IsPrint(r) {
+			return false
+		}
+	}
+	return true
 }
 
 // hasLine reports whether text has line on a line of its own, ignoring the

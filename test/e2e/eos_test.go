@@ -439,6 +439,26 @@ type userVars struct {
 	DemoteLogin bool
 }
 
+// A step that fails without touching the switch stops the apply before its
+// commit. Conn3x aborts the session as it exits: a failed apply doesn't
+// close its providers, so nothing else would.
+func TestEOSStoppedRunLeavesNoSession(t *testing.T) {
+	sw := eosSwitch(t)
+	w := newWorkdir(t, "eosstop")
+	w.writeAs("main.circuit.hcl", sw)
+	w.mustConn3x("init", "-no-color")
+	out, code := w.conn3x("apply", "-auto-approve", "-no-color")
+	if code == 0 || !strings.Contains(out, "password_wo didn't reach the apply") {
+		t.Fatalf("apply exited %d:\n%s", code, out)
+	}
+	if sessions := sw.mustCLI(t, "show configuration sessions\n"); strings.Contains(sessions, "conn3x-") {
+		t.Fatalf("a conn3x session was left pending:\n%s", sessions)
+	}
+	if running := sw.mustCLI(t, "show running-config\n"); strings.Contains(running, "vlan 221") {
+		t.Fatalf("the stopped apply changed the switch:\n%s", running)
+	}
+}
+
 // TestEOSUser makes an account with a password and a key, changes its role
 // without touching the password, then rotates the password. No log line
 // carries the password or its hash, and Conn3x won't demote its own login.
@@ -458,13 +478,22 @@ func TestEOSUser(t *testing.T) {
 		return ""
 	}
 
+	// The account is already there, with another password: the first apply
+	// must replace it, not record a password the switch never took.
+	sw.mustCLI(t, "configure\nusername c3xops secret 0ld-by-hand\nend\n")
+	before := hash()
+
 	// In the environment: OpenTofu logs its command line, -var values too.
 	w.env = append(w.env, "TF_LOG=INFO", "TF_VAR_password=Init1al!")
 	out := w.mustConn3x("apply", "-auto-approve", "-no-color")
 	w.env = w.env[:len(w.env)-2]
 	first := hash()
-	if first == "" {
-		t.Fatalf("no secret on the account:\n%s", sw.mustCLI(t, "show running-config | include username c3xops\n"))
+	if first == "" || first == before {
+		t.Fatalf("the account kept the secret it had (%v):\n%s", first == before, sw.mustCLI(t, "show running-config | include username c3xops\n"))
+	}
+	// A key-only account can't log in with a password, an empty one included.
+	if got := sw.mustCLI(t, "show running-config | include username c3xkey\n"); !strings.Contains(got, "username c3xkey role network-operator secret *") {
+		t.Fatalf("key-only account:\n%s", got)
 	}
 	for _, l := range strings.Split(out, "\n") {
 		if strings.Contains(l, "Init1al!") || strings.Contains(l, first) || strings.Contains(l, "$6$") {
@@ -487,8 +516,20 @@ func TestEOSUser(t *testing.T) {
 	}
 
 	w.mustConn3x("apply", "-auto-approve", "-no-color", "-var", "password=R0tated!")
-	if h := hash(); h == "" || h == first {
+	rotated := hash()
+	if rotated == "" || rotated == first {
 		t.Fatal("a new password didn't change the secret")
+	}
+
+	// A password changed on the switch is drift, and the next apply puts
+	// the step's back.
+	sw.mustCLI(t, "configure\nusername c3xops secret by-hand\nend\n")
+	if out, code := w.conn3x("plan", "-detailed-exitcode", "-no-color", "-var", "password=R0tated!"); code != 2 {
+		t.Fatalf("plan after a password change by hand exited %d:\n%s", code, out)
+	}
+	w.mustConn3x("apply", "-auto-approve", "-no-color", "-var", "password=R0tated!")
+	if hash() != rotated {
+		t.Fatal("the apply didn't put the step's password back")
 	}
 
 	v.DemoteLogin = true
@@ -503,7 +544,7 @@ func TestEOSUser(t *testing.T) {
 	w.writeAs("main.circuit.hcl", v)
 	w.mustConn3x("destroy", "-auto-approve", "-no-color", "-var", "password=R0tated!")
 	// The CLI echoes the command, so look for the line itself.
-	if got := sw.mustCLI(t, "show running-config | include username c3xops\n"); strings.Contains(got, "\nusername c3xops ") {
+	if got := sw.mustCLI(t, "show running-config | include username c3x\n"); strings.Contains(got, "\nusername c3x") {
 		t.Fatalf("destroy left the account:\n%s", got)
 	}
 }

@@ -29,8 +29,17 @@ import (
 // ".tofu", "tofu.rc" and a bare "tofu" don't match.
 var commandPattern = regexp.MustCompile(`(^|[^\w.\-/])tofu( (?:\[|-|%s|init|plan|apply|destroy|validate|fmt|console|show|state|import|output|providers|refresh|taint|untaint|workspace|graph|login|logout|get|force-unlock|test|metadata|version|modules)\b)`)
 
+// protocolPrefix starts the magic strings of the state-encryption protocol
+// for external key providers and methods. They're what the external program
+// and Conn3x say to each other, not text for a person, and a program written
+// for OpenTofu sends them as they are.
+const protocolPrefix = "OpenTofu-External-"
+
 func rewriteLiteral(lit string) string {
+	const kept = "\x00protocol\x00"
+	lit = strings.ReplaceAll(lit, protocolPrefix, kept)
 	lit = strings.ReplaceAll(lit, "OpenTofu", "Conn3x")
+	lit = strings.ReplaceAll(lit, kept, protocolPrefix)
 	return commandPattern.ReplaceAllString(lit, "${1}conn3x$2")
 }
 

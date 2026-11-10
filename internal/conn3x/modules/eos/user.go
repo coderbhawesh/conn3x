@@ -12,15 +12,23 @@ import (
 )
 
 // User is a local account on a switch, as eos_user owns it. Settings left
-// unset are left alone. EOS keeps only a salted hash of a secret, so a read
-// can tell whether the account has one, never which.
+// unset are left alone. EOS keeps a salted hash of a secret, and Conn3x sends
+// the hash, not the password, so a read can tell whether the account holds
+// the step's secret.
 type User struct {
 	Name       string
 	Privilege  int    // 0 to 15; -1 to leave
 	Role       string // "" to leave
 	WantSecret bool   // the step sets a password
-	Secret     string // the password, at apply only
-	Rotate     bool   // the password changed: send it even if one is set
+	Secret     string // its hash, as SecretHash writes it, at apply only
+	// SecretIs reports whether hash, as the switch prints it, is the step's
+	// password. Nil when a read can't tell, having no HMAC key: then any
+	// secret counts.
+	SecretIs func(hash string) bool
+	// NoPassword true lets the account log in with no password at all;
+	// false never does; nil leaves an account that is there as it is. A new
+	// account without a password gets "secret *", which no password matches.
+	NoPassword *bool
 	SSHKey     *string
 }
 
@@ -41,10 +49,10 @@ func (u User) Validate() error {
 	if u.Role != "" && !roleName.MatchString(u.Role) {
 		return fmt.Errorf("role %q is not a role name, such as network-admin", u.Role)
 	}
-	if strings.ContainsAny(u.Secret, " \t\r\n") {
-		return errors.New("the password can't hold spaces or line breaks: the EOS CLI would read the rest as more of the command")
+	if u.WantSecret && u.NoPassword != nil && *u.NoPassword {
+		return errors.New("nopassword = true lets the account in with no password, so it can't have password_wo as well")
 	}
-	if u.SSHKey != nil && *u.SSHKey != "" && !sshKey.MatchString(*u.SSHKey) {
+	if u.SSHKey != nil && *u.SSHKey != "" && (!sshKey.MatchString(*u.SSHKey) || hasControl(*u.SSHKey)) {
 		return errors.New("ssh_key must be one public key line, such as \"ssh-ed25519 AAAA... alice@laptop\"")
 	}
 	return nil
@@ -67,9 +75,10 @@ func (u User) lines(config string) (main, key string) {
 	return main, key
 }
 
-// fields reads a main line's privilege (1 when EOS leaves it out), role
-// and whether it holds a secret.
-func fields(main string) (privilege int, role string, secret bool) {
+// fields reads a main line's privilege (1 when EOS leaves it out), role,
+// secret ("" for none; its hash, or "*" for one nothing matches) and
+// whether it says nopassword.
+func fields(main string) (privilege int, role, secret string, nopassword bool) {
 	privilege = 1
 	f := strings.Fields(main)
 	for i := 2; i < len(f); i++ {
@@ -83,24 +92,44 @@ func fields(main string) (privilege int, role string, secret bool) {
 				role = f[i+1]
 			}
 		case "secret":
-			secret = true
+			secret = f[len(f)-1] // after its type, as in "secret sha512 $6$..."
+		case "nopassword":
+			nopassword = true
 		}
 	}
-	return privilege, role, secret
+	return privilege, role, secret, nopassword
 }
 
-// InSync reports whether the account matches. A secret only has to be
-// there; which one can't be read.
+// secretOK reports whether a main line's secret is the step's.
+func (u User) secretOK(secret string) bool {
+	if u.SecretIs == nil {
+		return secret != ""
+	}
+	return u.SecretIs(secret)
+}
+
+// InSync reports whether the account matches, its secret included.
 func (u User) InSync(config string) bool {
 	main, key := u.lines(config)
 	if main == "" {
 		return false
 	}
-	priv, role, secret := fields(main)
-	if (u.Privilege >= 0 && priv != u.Privilege) || (u.Role != "" && role != u.Role) || (u.WantSecret && !secret) {
+	priv, role, secret, nopassword := fields(main)
+	if (u.Privilege >= 0 && priv != u.Privilege) || (u.Role != "" && role != u.Role) || (u.WantSecret && !u.secretOK(secret)) {
+		return false
+	}
+	if u.NoPassword != nil && !u.WantSecret && *u.NoPassword != nopassword {
 		return false
 	}
 	return u.SSHKey == nil || key == u.keyLine()
+}
+
+// OpenLogin reports whether the account is there with nopassword while the
+// step says nothing about it: it then logs in with an empty password.
+func (u User) OpenLogin(config string) bool {
+	main, _ := u.lines(config)
+	_, _, _, nopassword := fields(main)
+	return nopassword && !u.WantSecret && u.NoPassword == nil
 }
 
 func (u User) keyLine() string {
@@ -123,20 +152,31 @@ func (u User) Commands(config string) []string {
 		settings += " role " + u.Role
 	}
 	var cmds []string
+	open := u.NoPassword != nil && *u.NoPassword
 	if main == "" {
 		// A new account needs a secret or nopassword in the same line.
-		if u.WantSecret {
-			cmds = append(cmds, base+settings+" secret "+u.Secret)
-		} else {
+		switch {
+		case u.WantSecret:
+			cmds = append(cmds, base+settings+" secret sha512 "+u.Secret)
+		case open:
 			cmds = append(cmds, base+settings+" nopassword")
+		default:
+			cmds = append(cmds, base+settings+" secret *")
 		}
 	} else {
-		priv, role, secret := fields(main)
+		priv, role, secret, nopassword := fields(main)
 		if (u.Privilege >= 0 && priv != u.Privilege) || (u.Role != "" && role != u.Role) {
 			cmds = append(cmds, base+settings)
 		}
-		if u.WantSecret && (u.Rotate || !secret) {
-			cmds = append(cmds, base+" secret "+u.Secret)
+		switch {
+		case u.WantSecret:
+			if !u.secretOK(secret) {
+				cmds = append(cmds, base+" secret sha512 "+u.Secret)
+			}
+		case open && !nopassword:
+			cmds = append(cmds, base+" nopassword")
+		case u.NoPassword != nil && !open && nopassword:
+			cmds = append(cmds, base+" secret *")
 		}
 	}
 	if u.SSHKey != nil && key != u.keyLine() {

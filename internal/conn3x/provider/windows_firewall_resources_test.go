@@ -27,6 +27,7 @@ func TestWinFirewallRuleValidate(t *testing.T) {
 	}
 	for name, a := range map[string]map[string]cty.Value{
 		"wildcard":        {"name": cty.StringVal("web*")},
+		"allows it all":   {"name": cty.StringVal("a")},
 		"ports, no proto": {"name": cty.StringVal("a"), "local_ports": list("80")},
 		"blocks ssh":      {"name": cty.StringVal("a"), "action": cty.StringVal("block")},
 		"blocks tcp 22":   {"name": cty.StringVal("a"), "action": cty.StringVal("block"), "protocol": cty.StringVal("tcp"), "local_ports": list("20-30")},
@@ -37,6 +38,16 @@ func TestWinFirewallRuleValidate(t *testing.T) {
 	} {
 		if d := r.validate(objFor(r.schema(), a)); !d.HasErrors() {
 			t.Errorf("%s: accepted", name)
+		}
+	}
+	// Everything in, from anywhere, has to be asked for.
+	for name, a := range map[string]map[string]cty.Value{
+		"any, said so": {"name": cty.StringVal("a"), "protocol": cty.StringVal("any")},
+		"one subnet":   {"name": cty.StringVal("a"), "remote_addresses": list("10.0.0.0/8")},
+		"outbound":     {"name": cty.StringVal("a"), "direction": cty.StringVal("outbound")},
+	} {
+		if d := r.validate(objFor(r.schema(), a)); d.HasErrors() {
+			t.Errorf("%s: %v", name, d.Err())
 		}
 	}
 	// Blocking 22 is fine when Conn3x comes in on another port.

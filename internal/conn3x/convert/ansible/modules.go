@@ -202,6 +202,9 @@ func (in *input) render(key, s string) string {
 		in.fail(fmt.Sprintf("%s refers to %q, which isn't %s the converter can fill in", key, name, what))
 		return m
 	})
+	if strings.Contains(out, vaultMark) {
+		in.fail(key + " is encrypted with Ansible Vault, which the converter can't read; set it by hand, from an ephemeral variable if it's a secret")
+	}
 	if strings.Contains(out, "{{") || strings.Contains(out, "{%") {
 		in.fail(key + " uses a Jinja expression the converter can't translate")
 	}
@@ -225,6 +228,29 @@ func (in *input) mode(key string) (attr, bool) {
 		return attr{}, false
 	}
 	return attr{key: "mode", val: cty.StringVal(m)}, true
+}
+
+// number reads an argument that must be a whole number, such as a uid.
+func (in *input) number(key string) attr {
+	v := in.str(key)
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || !digits.MatchString(v) {
+		in.fail(fmt.Sprintf("%s %q is not a whole number", key, v))
+	}
+	return attr{key: key, val: cty.NumberIntVal(n)}
+}
+
+// moduleFile is the expression for the path of a file beside the circuit.
+func moduleFile(p string) string { return `"${path.module}/` + quoted(p) + `"` }
+
+// modeNote is the note for a copy or template task without mode. Ansible
+// then leaves the mode of a file that's already there; the step sets its
+// default, which would open up a file kept at 0600.
+func (in *input) modeNote() []string {
+	if in.has("mode") {
+		return nil
+	}
+	return []string{"TODO(convert): Set mode if this file isn't meant to be 0644. The task set none, so Ansible left a file that was already there as it was; this step sets 0644."}
 }
 
 func s(key, v string) attr { return attr{key: key, val: cty.StringVal(v)} }
@@ -273,6 +299,12 @@ func (in *input) local(sub, name string) string {
 	}
 	for _, p := range places {
 		if _, err := os.Stat(filepath.Join(in.dir, p)); err == nil {
+			// A playbook or role from someone else could link to any file
+			// on this machine, to be read into a step or copied to a circuit.
+			if !linksStayInside(in.dir, p) {
+				in.fail(fmt.Sprintf("%s is outside the playbook's or role's own directory, or is a link to a file that is; copy the file in if it belongs there", p))
+				return ""
+			}
 			return filepath.ToSlash(p)
 		}
 	}
@@ -282,6 +314,21 @@ func (in *input) local(sub, name string) string {
 		in.fail(fmt.Sprintf("%s was not found beside the playbook or in %s/", name, sub))
 	}
 	return ""
+}
+
+// linksStayInside reports whether dir/p, with every link followed, is still
+// under dir.
+func linksStayInside(dir, p string) bool {
+	root, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return false
+	}
+	real, err := filepath.EvalSymlinks(filepath.Join(dir, p))
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(root, real)
+	return err == nil && filepath.IsLocal(rel)
 }
 
 func one(module string, attrs []attr, notes ...string) ([]step, string) {
@@ -398,7 +445,7 @@ func copyModule(in *input) ([]step, string) {
 		attrs = append(attrs, s("content", in.str("content")))
 	case in.has("src"):
 		if p := in.local("files", in.str("src")); p != "" {
-			attrs = append(attrs, attr{key: "content", raw: fmt.Sprintf(`file("${path.module}/%s")`, p)})
+			attrs = append(attrs, attr{key: "content", raw: "file(" + moduleFile(p) + ")"})
 			if in.role != nil {
 				in.copy(p)
 			}
@@ -423,7 +470,7 @@ func copyModule(in *input) ([]step, string) {
 		attrs = append(attrs, s("validate", v))
 	}
 	in.ignore("backup")
-	return one("file", in.owners(attrs))
+	return one("file", in.owners(attrs), in.modeNote()...)
 }
 
 // shellSyntax is what a shell reads differently from the plain argument
@@ -521,7 +568,7 @@ func templateModule(in *input) ([]step, string) {
 	if why != "" {
 		return nil, "renders a template that " + why + "; rewrite it in templatefile syntax (${var}, %{ if }) and use a template step"
 	}
-	attrs = append([]attr{{key: "source", raw: fmt.Sprintf(`"${path.module}/%s"`, source)}}, attrs...)
+	attrs = append([]attr{{key: "source", raw: moduleFile(source)}}, attrs...)
 	if vars != "" {
 		attrs = append(attrs, attr{key: "vars", raw: vars})
 	}
@@ -539,7 +586,7 @@ func templateModule(in *input) ([]step, string) {
 		attrs = append(attrs, s("validate", v))
 	}
 	in.ignore("backup")
-	return one("template", in.owners(attrs))
+	return one("template", in.owners(attrs), in.modeNote()...)
 }
 
 func packageModule(in *input) ([]step, string) {
@@ -596,7 +643,7 @@ func userModule(in *input) ([]step, string) {
 	in.state("present", "present")
 	attrs := []attr{s("name", in.str("name"))}
 	if in.has("uid") {
-		attrs = append(attrs, attr{key: "uid", raw: in.str("uid")})
+		attrs = append(attrs, in.number("uid"))
 	}
 	attrs = in.optional(attrs, "group", "group")
 	if in.has("groups") {
@@ -627,7 +674,7 @@ func groupModule(in *input) ([]step, string) {
 	in.state("present", "present")
 	attrs := []attr{s("name", in.str("name"))}
 	if in.has("gid") {
-		attrs = append(attrs, attr{key: "gid", raw: in.str("gid")})
+		attrs = append(attrs, in.number("gid"))
 	}
 	if in.has("system") {
 		attrs = append(attrs, attr{key: "system", val: cty.BoolVal(in.bool("system", false))})
@@ -1009,6 +1056,9 @@ func commandModule(in *input) ([]step, string) {
 	if cmd == "" {
 		return nil, "has no command"
 	}
+	if in.mod == "command" && shellSyntax.MatchString(cmd) {
+		return nil, "uses characters a shell reads, such as ; | $ * or >, which Ansible's command module hands to the program as plain text and a command step would run through /bin/sh; write it as you mean the shell to read it, in a command step"
+	}
 	if in.has("chdir") {
 		cmd = "cd " + shellQuote(in.str("chdir")) + " && " + cmd
 	}
@@ -1040,7 +1090,7 @@ func waitForModule(in *input) ([]step, string) {
 	var attrs []attr
 	attrs = in.optional(attrs, "path", "path")
 	if in.has("port") {
-		attrs = append(attrs, attr{key: "port", raw: in.str("port")})
+		attrs = append(attrs, in.number("port"))
 	}
 	if in.has("timeout") {
 		secs, err := strconv.Atoi(in.str("timeout"))
@@ -1136,7 +1186,7 @@ func aptRepositoryModule(in *input) ([]step, string) {
 	if err := (repo.Repo{Name: name, URL: source, Key: key, Suites: []string{suite}, Components: components}).Validate(pkg.Deb); err != nil {
 		return nil, "can't be a repository step: " + err.Error()
 	}
-	attrs := []attr{s("name", name), s("url", source), {key: "key", raw: fmt.Sprintf(`file("${path.module}/%s")`, keyFile)}, {key: "suites", val: stringList([]string{suite})}}
+	attrs := []attr{s("name", name), s("url", source), {key: "key", raw: "file(" + moduleFile(keyFile) + ")"}, {key: "suites", val: stringList([]string{suite})}}
 	if len(components) > 0 {
 		attrs = append(attrs, attr{key: "components", val: stringList(components)})
 	}
@@ -1183,7 +1233,7 @@ func yumRepositoryModule(in *input) ([]step, string) {
 		in.ignore("description")
 		notes = append(notes, "description dropped: Conn3x labels the repository with its name.")
 	}
-	return one("repository", []attr{s("name", name), s("url", urls[0]), {key: "key", raw: fmt.Sprintf(`file("${path.module}/%s")`, keyFile)}}, notes...)
+	return one("repository", []attr{s("name", name), s("url", urls[0]), {key: "key", raw: "file(" + moduleFile(keyFile) + ")"}}, notes...)
 }
 
 // A locale step also sets the host's LANG, which locale_gen doesn't, so

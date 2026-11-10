@@ -26,6 +26,7 @@ type fakeEOS struct {
 	mu       sync.Mutex
 	running  []block            // running-config
 	sessions map[string][]block // pending sessions, each a copy of the config with its lines in
+	marks    map[string]string  // their descriptions
 	timer    string             // the session waiting on its commit timer
 	refuse   string             // a script line containing this is refused
 	commits  int                // commit timers started
@@ -40,7 +41,7 @@ type block struct {
 func newFakeEOS(t *testing.T, running ...block) (*fakeEOS, cty.Value) {
 	t.Helper()
 	s := sshtest.New(t)
-	f := &fakeEOS{running: running, sessions: map[string][]block{}}
+	f := &fakeEOS{running: running, sessions: map[string][]block{}, marks: map[string]string{}}
 	s.SetExec(f.run)
 	conn := map[string]cty.Value{
 		"host":             cty.StringVal(s.Host),
@@ -51,7 +52,7 @@ func newFakeEOS(t *testing.T, running ...block) (*fakeEOS, cty.Value) {
 		// Validate refuses this; apply only waits it out.
 		"confirm_after": cty.StringVal("10ms"),
 	}
-	t.Cleanup(abortStaged)
+	t.Cleanup(func() { _ = FinishEOS() })
 	return f, eosStep("conn3x_eos_commit", nil, conn).GetAttr("ssh")
 }
 
@@ -76,6 +77,26 @@ func apply(cfg []block, lines []string) []block {
 		switch {
 		case strings.HasPrefix(l, "no vlan "):
 			cfg = slices.DeleteFunc(cfg, func(b block) bool { return b.head == strings.TrimPrefix(l, "no ") })
+			cur = -1
+		case strings.HasPrefix(l, "no username "):
+			cfg = slices.DeleteFunc(cfg, func(b block) bool { return strings.HasPrefix(b.head, strings.TrimPrefix(l, "no ")+" ") })
+			cur = -1
+		case strings.HasPrefix(l, "username "):
+			// EOS merges a username line into the one that's there: a
+			// secret, or nopassword, replaces only that part.
+			f := strings.Fields(l)
+			at := slices.IndexFunc(cfg, func(b block) bool { return strings.HasPrefix(b.head, "username "+f[1]+" ") })
+			if at < 0 {
+				cfg = append(cfg, block{head: l})
+			} else if f[2] == "secret" || f[2] == "nopassword" {
+				head := cfg[at].head
+				for _, w := range []string{" secret ", " nopassword"} {
+					head, _, _ = strings.Cut(head, w)
+				}
+				cfg[at] = block{head: head + " " + strings.Join(f[2:], " ")}
+			} else {
+				cfg[at] = block{head: l}
+			}
 			cur = -1
 		case strings.HasPrefix(l, "vlan "), strings.HasPrefix(l, "hostname "):
 			cur = slices.IndexFunc(cfg, func(b block) bool {
@@ -122,10 +143,10 @@ func (f *fakeEOS) run(cmd string, stdin []byte) (string, int) {
 		return "", 0
 	case cmd == "show running-config":
 		return render(f.running), 0
-	case cmd == "show configuration sessions | json":
+	case cmd == "show configuration sessions | json", cmd == "show configuration sessions detail | json":
 		out := map[string]any{"sessions": map[string]any{}, "maxOpenSessions": 5}
 		for name := range f.sessions {
-			out["sessions"].(map[string]any)[name] = map[string]string{"state": "pending"}
+			out["sessions"].(map[string]any)[name] = map[string]string{"state": "pending", "description": f.marks[name]}
 		}
 		if f.timer != "" {
 			out["commitTimerSessionName"] = f.timer
@@ -144,9 +165,16 @@ func (f *fakeEOS) run(cmd string, stdin []byte) (string, int) {
 		switch {
 		case verb == "abort":
 			delete(f.sessions, name)
+			delete(f.marks, name)
+		case strings.HasPrefix(verb, "description "):
+			f.marks[name] = strings.TrimPrefix(verb, "description ")
 		case strings.HasPrefix(verb, "commit timer"):
+			if _, ok := f.sessions[name]; !ok {
+				return "% Cannot commit session " + name + " (not present) at line 1\n", 1
+			}
 			f.running, f.timer = f.sessions[name], name
 			delete(f.sessions, name)
+			delete(f.marks, name)
 			f.commits++
 		case verb == "commit" && f.timer == name:
 			f.timer = ""
@@ -379,6 +407,7 @@ func TestEOSRemovalsLostToAnotherRunAreListed(t *testing.T) {
 	}
 	f.mu.Lock()
 	clear(f.sessions) // the other run's Open aborts ours
+	clear(f.marks)
 	f.mu.Unlock()
 	err := create(vlanApply, vlanStep(40, "", ssh))
 	if err == nil || !strings.Contains(err.Error(), "another Conn3x run") || !strings.Contains(err.Error(), "remove these by hand: no vlan 10") {
@@ -386,5 +415,145 @@ func TestEOSRemovalsLostToAnotherRunAreListed(t *testing.T) {
 	}
 	if running, commits, _, _ := f.state(); commits != 0 || !strings.Contains(running, "vlan 10") {
 		t.Errorf("%d commits, running:\n%s", commits, running)
+	}
+}
+
+func userStep(name, password string, ssh cty.Value) (planned, config cty.Value) {
+	attrs := map[string]cty.Value{"name": cty.StringVal(name), "on_remove": cty.StringVal(onRemoveDelete)}
+	config = onSwitch(eosStep("conn3x_eos_user", map[string]cty.Value{"name": cty.StringVal(name), "password_wo": cty.StringVal(password)}, nil), ssh)
+	key, _ := hmacKey(false)
+	attrs["password_hmac"] = cty.StringVal(eosPasswordHMAC(key, eosUserID(config), password))
+	return onSwitch(eosStep("conn3x_eos_user", attrs, nil), ssh), config
+}
+
+func userInSync(t *testing.T, state cty.Value) bool {
+	t.Helper()
+	resp := eosUserKind.read(ctx, providers.ReadResourceRequest{PriorState: state})
+	if err := resp.Diagnostics.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return resp.NewState.GetAttr("in_sync").True()
+}
+
+// An account that was on the switch with another password gets the step's:
+// state must not say a password is set that the switch never took. And a
+// new password whose session never commits shows as out of sync at the
+// next refresh, so the next apply sends it again.
+func TestEOSUserSendsThePasswordTheSwitchLacks(t *testing.T) {
+	t.Setenv(hmacKeyEnv, strings.Repeat("k", 32))
+	f, ssh := newFakeEOS(t, block{head: "username legacy privilege 15 role network-admin secret sha512 $6$old$Hash"})
+	set := func(prior cty.Value, password string, commit bool) cty.Value {
+		t.Helper()
+		planned, config := userStep("legacy", password, ssh)
+		if prior == cty.NilVal {
+			prior = cty.NullVal(planned.Type())
+		}
+		resp := applyEOSUser(ctx, providers.ApplyResourceChangeRequest{PriorState: prior, PlannedState: planned, Config: config})
+		if err := resp.Diagnostics.Err(); err != nil {
+			t.Fatal(err)
+		}
+		if commit {
+			if err := create(commitApply, commitFor(ssh, true)); err != nil {
+				t.Fatal(err)
+			}
+		} else {
+			abortStaged() // the run stopped before the circuit's commit
+		}
+		return resp.NewState
+	}
+	key, _ := hmacKey(false)
+	hashOf := func(password string) string {
+		_, config := userStep("legacy", password, ssh)
+		return eosSecret(key, eosUserID(config), password)
+	}
+
+	state := set(cty.NilVal, "New2", true)
+	if running, _, _, _ := f.state(); !strings.Contains(running, "username legacy privilege 15 role network-admin secret sha512 "+hashOf("New2")+"\n") {
+		t.Fatalf("the account that was there kept its old secret:\n%s", running)
+	}
+	if !userInSync(t, state) {
+		t.Error("not in sync after the password was set")
+	}
+
+	rotated := set(state, "Rot8", false)
+	if running, _, _, _ := f.state(); !strings.Contains(running, hashOf("New2")) {
+		t.Fatalf("an uncommitted session changed the secret:\n%s", running)
+	}
+	if userInSync(t, rotated) {
+		t.Fatal("state records a password the switch never took, and the refresh calls it in sync")
+	}
+	state = set(rotated, "Rot8", true)
+	if running, _, _, _ := f.state(); !strings.Contains(running, hashOf("Rot8")) || !userInSync(t, state) {
+		t.Errorf("the next apply didn't send the password again:\n%s", running)
+	}
+
+	// Changed by hand on the switch: a refresh sees another hash.
+	f.mu.Lock()
+	f.running = apply(f.running, []string{"username legacy secret sha512 $6$hand$Made"})
+	f.mu.Unlock()
+	if userInSync(t, state) {
+		t.Error("a secret changed on the switch still reads as in sync")
+	}
+}
+
+// Two circuits on one switch share its session, so the first circuit's
+// commit makes the other's lines so far live. When the other then fails,
+// the error mustn't say nothing changed.
+func TestEOSRefusalAfterAnotherCircuitsCommit(t *testing.T) {
+	f, ssh := newFakeEOS(t)
+	f.refuse = "vlan 30"
+	for _, id := range []int{10, 20} { // 10 is circuit A's, 20 circuit B's first
+		if err := create(vlanApply, vlanStep(id, "", ssh)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := create(commitApply, commitFor(ssh, true)); err != nil { // A's commit
+		t.Fatal(err)
+	}
+	if err := create(vlanApply, vlanStep(40, "", ssh)); err != nil {
+		t.Fatal(err)
+	}
+	err := create(vlanApply, vlanStep(30, "", ssh)) // B's later step
+	if err == nil || strings.Contains(err.Error(), "Nothing was changed") || !strings.Contains(err.Error(), "stays") {
+		t.Fatalf("err = %v", err)
+	}
+	if running, _, _, pending := f.state(); pending != 0 || !strings.Contains(running, "vlan 20") || strings.Contains(running, "vlan 40") {
+		t.Errorf("%d pending sessions, running:\n%s", pending, running)
+	}
+}
+
+// A run that stops before the commit, with a removal staged whose step is
+// already forgotten: when the removal can't be committed on its own
+// either, the end of the run says so, not only the log.
+func TestEOSFinishReportsRemovalsLeftBehind(t *testing.T) {
+	f, ssh := newFakeEOS(t, block{head: "vlan 10"})
+	if err := create(vlanApply, vlanStep(30, "", ssh)); err != nil {
+		t.Fatal(err)
+	}
+	if err := destroy(vlanApply, vlanStep(10, "", ssh)); err != nil { // staged with vlan 30
+		t.Fatal(err)
+	}
+	if err := FinishEOS(); err != nil {
+		t.Fatalf("the removal committed on its own, so nothing is left to report: %v", err)
+	}
+	if running, _, _, _ := f.state(); strings.Contains(running, "vlan 10") || strings.Contains(running, "vlan 30") {
+		t.Fatalf("running:\n%s", running)
+	}
+
+	f.mu.Lock()
+	f.running = []block{{head: "vlan 10"}}
+	f.mu.Unlock()
+	if err := create(vlanApply, vlanStep(30, "", ssh)); err != nil {
+		t.Fatal(err)
+	}
+	if err := destroy(vlanApply, vlanStep(10, "", ssh)); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	f.refuse = "no vlan 10" // the switch won't take the removal again
+	f.mu.Unlock()
+	err := FinishEOS()
+	if err == nil || !strings.Contains(err.Error(), "remove these by hand: no vlan 10") {
+		t.Fatalf("err = %v", err)
 	}
 }

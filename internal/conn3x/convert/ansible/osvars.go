@@ -68,7 +68,7 @@ func (c *converter) familyVars(tasks []*yaml.Node) (*yaml.Node, map[string]map[s
 			path := c.path("vars/" + f.ansible + "." + m[1])
 			src, err := os.ReadFile(path)
 			var doc yaml.Node
-			if err != nil || !exactlyNamed(path) || yaml.Unmarshal(src, &doc) != nil || len(doc.Content) == 0 {
+			if err != nil || !exactlyNamed(path) || parse(src, &doc) != nil || len(doc.Content) == 0 {
 				return nil, nil, nil
 			}
 			vals[f.conn3x], whys[f.conn3x] = map[string]string{}, map[string]string{}

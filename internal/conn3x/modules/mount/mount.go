@@ -127,20 +127,27 @@ func Apply(ctx context.Context, r modules.Runner, m Mount) error {
 		return err
 	}
 	p := ssh.Quote(m.Path)
-	script := "mkdir -p -- " + p + " && mount " + p
+	// In a sticky directory the mount point is one made here, or one nobody
+	// else can swap for a link to somewhere else.
+	script := "route_mkdir " + p + " && mount " + p
 	switch {
 	case a.Mounted && a.LiveFSType == m.FSType && (strings.Contains(m.Src, "=") || a.Source == m.Src):
-		script = "mount -o remount " + p
+		script = gone + "mount -o remount " + p
 	case a.Mounted:
-		script = "umount " + p + " && mount " + p
+		script = gone + "umount " + p + " && mount " + p
 	}
-	return check(r.Run(ctx, modules.GuardRoot(script, modules.Follow(m.Path)), nil))
+	return check(r.Run(ctx, modules.GuardRoot(modules.Settled+"p="+p+"\n"+script, modules.Follow(m.Path)), nil))
 }
+
+// gone stops a script whose mount point went missing in a sticky directory,
+// where what turns up next may be anyone's.
+const gone = `route_settled "$p" || { echo "$p is gone" >&2; exit 1; }
+`
 
 // Delete unmounts the file system and removes its fstab entry.
 func Delete(ctx context.Context, r modules.Runner, m Mount) error {
 	p := ssh.Quote(m.Path)
-	if err := check(r.Run(ctx, modules.GuardRoot("if findmnt -M "+p+" >/dev/null 2>&1; then umount "+p+"; fi", modules.Follow(m.Path)), nil)); err != nil {
+	if err := check(r.Run(ctx, modules.GuardRoot(modules.Settled+"if route_settled "+p+" && findmnt -M "+p+" >/dev/null 2>&1; then umount "+p+"; fi", modules.Follow(m.Path)), nil)); err != nil {
 		return err
 	}
 	return writeFstab(ctx, r, edit.Line{Regexp: m.entryRegexp(), State: edit.Absent})

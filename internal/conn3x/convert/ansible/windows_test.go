@@ -86,6 +86,7 @@ func TestWindowsMappings(t *testing.T) {
 		`microsoft.ad.domain_child: {dns_domain_name: emea.lab.example.com, domain_admin_user: 'lab.example.com\admin', domain_admin_password: x, safe_mode_password: x, domain_type: child, log_path: 'E:\Logs'}`: {
 			"windows_ad_domain {", `domain_name = "emea.lab.example.com"`, `username    = "lab.example.com\\admin"`, `log_path    = "E:\\Logs"`, "TODO(convert): Set password_wo and safe_mode_password_wo",
 		},
+		`win_firewall_rule: {name: Lab, protocol: any, action: allow, direction: in}`:  {`protocol = "any"`},
 		`win_dns_client: {adapter_names: Ethernet, dns_servers: [10.0.0.4, 10.0.0.5]}`: {"windows_dns_client {", `interface = "Ethernet"`, `servers   = ["10.0.0.4", "10.0.0.5"]`},
 		`win_firewall_rule: {name: SQL, localport: '1433,1434', remoteip: '10.0.0.0/8', protocol: tcp, profiles: [Domain, Private], direction: out, action: block}`: {
 			`local_ports      = ["1433", "1434"]`, `remote_addresses = ["10.0.0.0/8"]`, `profiles         = ["domain", "private"]`, `direction        = "outbound"`, `action           = "block"`,
@@ -143,7 +144,8 @@ func TestWindowsLeftForAPerson(t *testing.T) {
 		"https binding":                `website: {name: a, physical_path: 'C:\x', bindings: {set: [{port: 443, protocol: https}]}}`,
 		"bindings.set":                 `website: {name: a, physical_path: 'C:\x', bindings: {add: [{port: 80}]}}`,
 		"can't take":                   `win_firewall_rule: {name: 'a*b', localport: 80, protocol: tcp}`,
-		"sets program":                 `win_firewall_rule: {name: a, program: 'C:\x.exe'}`,
+		"sets program":                 `win_firewall_rule: {name: a, program: 'C:\x.exe', localport: 80, protocol: tcp}`,
+		"allows all inbound traffic":   `win_firewall_rule: {name: a, action: allow, direction: in}`,
 		"without DNS":                  `microsoft.ad.domain: {dns_domain_name: lab.test, safe_mode_password: x, install_dns: false}`,
 		"sets forest_mode":             `microsoft.ad.domain: {dns_domain_name: lab.test, safe_mode_password: x, forest_mode: WinThreshold}`,
 		"not a new tree":               `microsoft.ad.domain_child: {dns_domain_name: corp.test, domain_type: tree, domain_admin_user: a@lab.test}`,

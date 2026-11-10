@@ -178,7 +178,11 @@ func (c *converter) playRole(n *yaml.Node) *roleCall {
 	why := ""
 	for _, k := range sortedKeys(m) {
 		switch {
-		case k == "role" || k == "name" || k == "tags":
+		case k == "role" || k == "name":
+		case k == "tags":
+			if neverTagged(m[k]) {
+				why = firstNonEmpty(why, neverReason)
+			}
 		case k == "vars":
 			for kk, v := range mapping(m[k]) {
 				call.vars[kk] = v
@@ -223,6 +227,8 @@ func (c *converter) includeRole(n *yaml.Node, mod string, args map[string]*yaml.
 			}
 		case k == "loop_control":
 			why = firstNonEmpty(why, call.setLoopControl(m[k]))
+		case k == "tags" && neverTagged(m[k]):
+			why = firstNonEmpty(why, neverReason)
 		case k == "name" || k == "tags" || k[strings.LastIndex(k, ".")+1:] == mod && !keywords[k]:
 		case k == "vars":
 			for kk, v := range mapping(m[k]) {
@@ -265,6 +271,8 @@ func (call *roleCall) setLoopControl(n *yaml.Node) string {
 func (c *converter) checkCall(call *roleCall, why string) *roleCall {
 	switch {
 	case why != "":
+	case c.playNever:
+		why = neverReason
 	case c.playNoLog:
 		why = "runs a role in a play that sets no_log, which its circuit wouldn't keep; convert the role with -role and check what it writes before calling it"
 	case c.otherUser != "":

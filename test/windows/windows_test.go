@@ -1018,7 +1018,10 @@ foreach ($move in @(@($leaf, ($A.dir + '\a\moved')), @(($A.dir + '\a'), ($A.dir 
 }
 try { [IO.Directory]::Delete($leaf); $out += 'deleted' } catch { $out += 'refused' }
 [IO.File]::WriteAllText($leaf + '\t', 'x')
-if ([Conn3xFs]::MoveFileExW($leaf + '\t', $leaf + '\done', 9)) { $out += 'renamed inside' } else { $out += 'rename failed' }
+# DELETE, which a rename needs.
+$t = Open-In 't' 0x10080 7
+try { [Conn3xFs]::RenameTo($t, 'done'); $out += 'renamed inside' } catch { $out += 'rename failed' } finally { $t.Dispose() }
+if (-not [IO.File]::Exists($leaf + '\done')) { $out += 'not there' }
 $out -join ','`)
 	got := strings.TrimSpace(run(t, c, script, map[string]any{"dir": dir}).Text)
 	if got != "refused,refused,refused,renamed inside" {

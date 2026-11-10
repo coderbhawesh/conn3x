@@ -4,8 +4,10 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -47,11 +49,19 @@ func withReport(cmd *command.Command) {
 		}
 		started := time.Now()
 		code := run(m)
-		if err := writeApplyReport(path, stream, started, code == 0); err != nil {
+		err := writeApplyReport(path, stream, started, code == 0)
+		var long runreport.LongLines
+		switch {
+		case errors.As(err, &long):
+			// The report is written and says what the apply did; only
+			// what those lines carried, such as a very large output or
+			// error, is missing from it.
+			fmt.Fprintf(stderr, "Warning: the report at %s is incomplete: %s\n", path, err)
+		case err != nil && code == 0:
+			fmt.Fprintf(stderr, "Error: the apply succeeded, but its report wasn't written: %s\n", err)
+			code = 1
+		case err != nil:
 			fmt.Fprintf(stderr, "Error: writing the report: %s\n", err)
-			if code == 0 {
-				code = 1
-			}
 		}
 		return code
 	}
@@ -64,24 +74,47 @@ func writeApplyReport(path, stream string, started time.Time, success bool) erro
 	}
 	defer in.Close()
 	r := runreport.New("apply", started)
-	if err := r.FromApply(in, success); err != nil {
+	streamErr := r.FromApply(in, success)
+	if _, long := streamErr.(runreport.LongLines); streamErr != nil && !long {
+		return streamErr
+	}
+	if err := writeReport(path, r); err != nil {
 		return err
 	}
-	return writeReport(path, r)
+	return streamErr
 }
 
 // writeReport writes r to path, readable by its owner only: its errors can
-// carry what a failed command printed, and reports get copied about.
+// carry what a failed command printed, and reports get copied about. It
+// writes a new file beside path and renames it into place, so a file
+// already there doesn't keep a wider mode and a link there is replaced, not
+// followed. Something that isn't a file, such as /dev/stdout, is written to
+// as it is.
 func writeReport(path string, r *runreport.Report) error {
-	out, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if st, err := os.Lstat(path); err == nil && !st.Mode().IsRegular() && st.Mode()&os.ModeSymlink == 0 {
+		out, err := os.OpenFile(path, os.O_WRONLY, 0)
+		if err != nil {
+			return err
+		}
+		if err := r.Write(out, time.Now()); err != nil {
+			out.Close()
+			return err
+		}
+		return out.Close()
+	}
+	out, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".*") // mode 0600
 	if err != nil {
 		return err
 	}
+	defer os.Remove(out.Name()) // a no-op after the rename
 	if err := r.Write(out, time.Now()); err != nil {
 		out.Close()
 		return err
 	}
-	return out.Close()
+	if err := out.Close(); err != nil {
+		return err
+	}
+	return os.Rename(out.Name(), path)
 }
 
 // withoutReport takes -report and its value out of a command line, for the

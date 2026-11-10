@@ -35,16 +35,17 @@ func downloadSchema() providers.Schema {
 	return providers.Schema{Block: &configschema.Block{
 		Description: "A file downloaded on the host and kept only if its SHA-256 matches.",
 		Attributes: map[string]*configschema.Attribute{
-			"id":        {Type: cty.String, Computed: true},
-			"revision":  revisionAttr(),
-			"url":       {Type: cty.String, Required: true, Description: "http or https URL."},
-			"dest":      {Type: cty.String, Required: true, Description: "Absolute path to save it to."},
-			"sha256":    {Type: cty.String, Required: true, Description: "Expected SHA-256, in lowercase hex."},
-			"mode":      {Type: cty.String, Optional: true, Description: "Octal permissions. Defaults to \"0644\"."},
-			"owner":     {Type: cty.String, Optional: true, Description: "Owner."},
-			"group":     {Type: cty.String, Optional: true, Description: "Group."},
-			"on_remove": {Type: cty.String, Optional: true, Computed: true, Description: "\"forget\" (default) leaves the file, \"delete\" removes it."},
-			"in_sync":   {Type: cty.Bool, Computed: true, Description: "Whether the file is there with the right checksum."},
+			"id":         {Type: cty.String, Computed: true},
+			"revision":   revisionAttr(),
+			"url":        {Type: cty.String, Required: true, Description: "http or https URL, without a user name or password."},
+			"netrc_file": {Type: cty.String, Optional: true, Description: "Absolute path of a netrc file on the host with the login for the URL's server. Needs curl on the host."},
+			"dest":       {Type: cty.String, Required: true, Description: "Absolute path to save it to."},
+			"sha256":     {Type: cty.String, Required: true, Description: "Expected SHA-256, in lowercase hex."},
+			"mode":       {Type: cty.String, Optional: true, Description: "Octal permissions. Defaults to \"0644\"."},
+			"owner":      {Type: cty.String, Optional: true, Description: "Owner."},
+			"group":      {Type: cty.String, Optional: true, Description: "Group."},
+			"on_remove":  {Type: cty.String, Optional: true, Computed: true, Description: "\"forget\" (default) leaves the file, \"delete\" removes it."},
+			"in_sync":    {Type: cty.Bool, Computed: true, Description: "Whether the file is there with the right checksum."},
 		},
 		BlockTypes: map[string]*configschema.NestedBlock{"ssh": connectionBlock()},
 	}}
@@ -52,7 +53,8 @@ func downloadSchema() providers.Schema {
 
 func downloadFrom(v cty.Value) fetch.Download {
 	return fetch.Download{URL: v.GetAttr("url").AsString(), Dest: v.GetAttr("dest").AsString(), SHA256: v.GetAttr("sha256").AsString(),
-		Mode: stringOr(v.GetAttr("mode"), ""), Owner: stringOr(v.GetAttr("owner"), ""), Group: stringOr(v.GetAttr("group"), "")}
+		Mode: stringOr(v.GetAttr("mode"), ""), Owner: stringOr(v.GetAttr("owner"), ""), Group: stringOr(v.GetAttr("group"), ""),
+		NetrcFile: stringOr(v.GetAttr("netrc_file"), "")}
 }
 
 func planDownload(req providers.PlanResourceChangeRequest) providers.PlanResourceChangeResponse {
@@ -134,7 +136,7 @@ func gitSchema() providers.Schema {
 		Attributes: map[string]*configschema.Attribute{
 			"id":       {Type: cty.String, Computed: true},
 			"revision": revisionAttr(),
-			"repo":     {Type: cty.String, Required: true, Description: "Repository URL. The host needs access to it."},
+			"repo":     {Type: cty.String, Required: true, Description: "Repository URL, without a user name or password. The host needs access to it. Plain http needs a full commit as ref."},
 			"dest":     {Type: cty.String, Required: true, Description: "Directory to check it out in."},
 			"ref":      {Type: cty.String, Optional: true, Description: "Branch, tag or full commit. Defaults to the remote's default branch."},
 			"commit":   {Type: cty.String, Computed: true, Description: "The commit checked out."},

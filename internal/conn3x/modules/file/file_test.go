@@ -209,6 +209,32 @@ func owners(t *testing.T, p string) string {
 	return strings.TrimSpace(string(res.Stdout))
 }
 
+// A file past MaxRead is an error after MaxRead+1 bytes, however large or
+// sparse it is, not a read of the whole of it into memory.
+func TestReadStopsAtTheSizeLimit(t *testing.T) {
+	saved := MaxRead
+	MaxRead = 1 << 10
+	defer func() { MaxRead = saved }()
+	big, fits := filepath.Join(t.TempDir(), "big"), filepath.Join(t.TempDir(), "fits")
+	if err := os.WriteFile(fits, bytes.Repeat([]byte("x"), MaxRead), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Create(big)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(1 << 40); err != nil { // sparse: a terabyte that takes no disk
+		t.Skipf("no sparse files here: %v", err)
+	}
+	f.Close()
+	if _, err := Read(ctx, localRunner{}, big); err == nil || !strings.Contains(err.Error(), "is over") {
+		t.Fatalf("reading a file over the limit: err = %v", err)
+	}
+	if got, err := Read(ctx, localRunner{}, fits); err != nil || len(got.Content) != MaxRead {
+		t.Fatalf("reading a file at the limit: %d bytes, err = %v", len(got.Content), err)
+	}
+}
+
 func TestReadRejectsDirectory(t *testing.T) {
 	if _, err := Read(ctx, localRunner{}, t.TempDir()); err == nil {
 		t.Fatal("reading a directory as a file succeeded")

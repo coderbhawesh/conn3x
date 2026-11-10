@@ -75,6 +75,11 @@ func NormalizeMode(mode string) string {
 
 const notRegular = 3
 
+// MaxRead is the largest file Read returns, the same as the agent's limit.
+// A host, or a user who owns a managed file, could otherwise fill the
+// controller's memory with one that's huge or sparse.
+var MaxRead = 255 << 20
+
 // unreadable is the exit code for a file the login user can't read. Without
 // it, base64's failure is lost in the pipe and the file reads as empty.
 const unreadable = 4
@@ -85,8 +90,11 @@ const validateFailed = 5
 
 // Read reports the file's current state. A missing file is not an error.
 // A runner that is a modules.FileReader answers natively when it can.
-func Read(ctx context.Context, r modules.Runner, p string) (Actual, error) {
-	if fr, ok := r.(modules.FileReader); ok {
+//
+// via are routes walked before p's own, for a p that was worked out from
+// another path: whoever owns the way to that one reads this one.
+func Read(ctx context.Context, r modules.Runner, p string, via ...modules.Route) (Actual, error) {
+	if fr, ok := r.(modules.FileReader); ok && len(via) == 0 {
 		st, err := fr.ReadFile(ctx, p)
 		switch {
 		case err == nil && !st.Exists:
@@ -100,14 +108,15 @@ func Read(ctx context.Context, r modules.Runner, p string) (Actual, error) {
 		}
 	}
 	q := ssh.Quote(p)
-	script := fmt.Sprintf(`p=%s
+	script := modules.Settled + fmt.Sprintf(`p=%s
+route_settled "$p" || { echo missing; exit 0; }
 [ -e "$p" ] || [ -L "$p" ] || { echo missing; exit 0; }
 [ -f "$p" ] || exit %d
 [ -r "$p" ] || { id -un; exit %d; }
 echo present
 stat -c '%%a %%U %%G' -- "$p" 2>/dev/null || stat -f '%%Lp %%Su %%Sg' "$p"
-base64 < "$p" | tr -d '\n'`, q, notRegular, unreadable)
-	res, err := run(ctx, r, modules.Guard(script, modules.Follow(p)), nil)
+head -c %d < "$p" | base64 | tr -d '\n'`, q, notRegular, unreadable, MaxRead+1)
+	res, err := run(ctx, r, modules.Guard(script, append(via, modules.Follow(p))...), nil)
 	if err != nil {
 		if res.ExitCode == notRegular {
 			return Actual{}, notRegularError(p)
@@ -136,6 +145,9 @@ base64 < "$p" | tr -d '\n'`, q, notRegular, unreadable)
 	if err != nil {
 		return Actual{}, fmt.Errorf("reading %s: %w", p, err)
 	}
+	if len(content) > MaxRead {
+		return Actual{}, fmt.Errorf("%s is over %d MiB, the most a file step reads", p, MaxRead>>20)
+	}
 	return Actual{
 		Exists:  true,
 		Content: string(content),
@@ -149,7 +161,8 @@ base64 < "$p" | tr -d '\n'`, q, notRegular, unreadable)
 // file the login user can't read still counts. Something else at the path
 // is an error, as it is for Read.
 func Exists(ctx context.Context, r modules.Runner, p string) (bool, error) {
-	res, err := run(ctx, r, modules.Guard(fmt.Sprintf(`p=%s
+	res, err := run(ctx, r, modules.Guard(modules.Settled+fmt.Sprintf(`p=%s
+route_settled "$p" || { echo missing; exit 0; }
 [ -e "$p" ] || [ -L "$p" ] || { echo missing; exit 0; }
 [ -f "$p" ] || exit %d
 echo present`, ssh.Quote(p), notRegular), modules.Follow(p)), nil)
@@ -180,7 +193,8 @@ func NeedsChange(d Desired, a Actual) bool {
 // is one, then replaces the target in one rename. The content is flushed to
 // disk before the rename and the directory after it, so a power cut leaves
 // the old file or the new one, never an empty one. On SELinux hosts the result is relabelled for its final path.
-func Apply(ctx context.Context, r modules.Runner, d Desired) error {
+// via is as for Read.
+func Apply(ctx context.Context, r modules.Runner, d Desired, via ...modules.Route) error {
 	if err := d.Validate(); err != nil {
 		return err
 	}
@@ -197,7 +211,7 @@ trap - EXIT
 `+SyncDir+`
 if command -v restorecon >/dev/null 2>&1; then restorecon -- "$p" 2>/dev/null || true; fi`,
 		ssh.Quote(d.Path), NormalizeMode(d.Mode), Ownership(d.Owner, d.Group), validateScript(d.ValidateCommand))
-	res, err := run(ctx, r, modules.GuardWrite(script, modules.Write{Owner: d.Owner, Group: d.Group}, modules.Parent(d.Path)), []byte(d.Content))
+	res, err := run(ctx, r, modules.GuardWrite(script, modules.Write{Owner: d.Owner, Group: d.Group, Path: d.Path}, append(via, modules.Parent(d.Path))...), []byte(d.Content))
 	if err != nil && res.ExitCode == validateFailed {
 		return &ValidateError{Output: strings.TrimSpace(string(res.Stderr))}
 	}
@@ -223,9 +237,20 @@ func validateScript(cmd string) string {
 // replaces "$p". An empty owner or group keeps the one "$p" has now, since
 // "$tmp" belongs to whoever ran mktemp, often root through become. Keeping
 // it is best effort: a login user can't give a file to someone else.
+//
+// In a sticky directory, like /tmp, what's at "$p" may be a file someone
+// put there first, and keeping its owner would hand them the new content.
+// So root keeps nothing from a file there that isn't root's, the login
+// user's or the owner asked for: it stops, and says to set both.
 func Ownership(owner, group string) string {
 	var b strings.Builder
 	if owner == "" || group == "" {
+		b.WriteString(modules.Settled + "route_hint='; set owner and group, or remove it first'\n")
+		if owner == "" {
+			b.WriteString("route_settled \"$p\" || true\n")
+		} else {
+			fmt.Fprintf(&b, "[ \"$(stat -c %%u -- \"$p\" 2>/dev/null)\" = \"$(id -u -- %s 2>/dev/null)\" ] || route_settled \"$p\" || true\n", ssh.Quote(owner))
+		}
 		b.WriteString(`if [ -e "$p" ]; then
   ids=$(stat -c '%u %g' -- "$p" 2>/dev/null || stat -f '%u %g' "$p")
 `)
@@ -238,10 +263,10 @@ func Ownership(owner, group string) string {
 		b.WriteString("fi\n")
 	}
 	if owner != "" {
-		fmt.Fprintf(&b, "chown -- %s \"$tmp\"\n", ssh.Quote(owner))
+		fmt.Fprintf(&b, "[ -n \"${CONN3X_ROUTE_OWN:-}\" ] || chown -- %s \"$tmp\"\n", ssh.Quote(owner))
 	}
 	if group != "" {
-		fmt.Fprintf(&b, "chgrp -- %s \"$tmp\"\n", ssh.Quote(group))
+		fmt.Fprintf(&b, "[ -n \"${CONN3X_ROUTE_OWN:-}\" ] || chgrp -- %s \"$tmp\"\n", ssh.Quote(group))
 	}
 	return b.String()
 }

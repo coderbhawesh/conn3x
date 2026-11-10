@@ -4,9 +4,11 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -27,6 +29,71 @@ func TestReportIsOwnerOnly(t *testing.T) {
 	}
 	if mode := st.Mode().Perm(); mode != 0o600 {
 		t.Fatalf("report mode = %o, want 600", mode)
+	}
+}
+
+// A report file that's already there doesn't keep its wider mode, and a
+// link there is replaced, not followed to what it points at.
+func TestReportReplacesWhatIsAtItsPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows has no Unix file modes")
+	}
+	dir := t.TempDir()
+	path, victim := filepath.Join(dir, "run.json"), filepath.Join(dir, "victim")
+	if err := os.WriteFile(path, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeReport(path, runreport.New("apply", time.Now())); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := os.Stat(path); st.Mode().Perm() != 0o600 {
+		t.Errorf("a report written over a 0644 file has mode %o, want 600", st.Mode().Perm())
+	}
+
+	if err := os.WriteFile(victim, []byte("keep me"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link.json")
+	if err := os.Symlink(victim, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeReport(link, runreport.New("apply", time.Now())); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(victim); string(got) != "keep me" {
+		t.Errorf("the report was written through the link, to its target: %q", got)
+	}
+	if st, _ := os.Lstat(link); !st.Mode().IsRegular() {
+		t.Errorf("the link at the report's path wasn't replaced: %v", st.Mode())
+	}
+	if left, _ := filepath.Glob(filepath.Join(dir, ".*")); len(left) != 0 {
+		t.Errorf("temporary files left behind: %v", left)
+	}
+}
+
+// A line of the stream too long to read doesn't lose the report or fail
+// the apply: the report is written from the rest.
+func TestApplyReportSurvivesALongLine(t *testing.T) {
+	saved := runreport.MaxLine
+	runreport.MaxLine = 1 << 10
+	defer func() { runreport.MaxLine = saved }()
+	dir := t.TempDir()
+	stream := filepath.Join(dir, "stream.json")
+	lines := `{"type":"planned_change","change":{"resource":{"addr":"module.web.conn3x_file.motd[\"a\"]","resource_type":"conn3x_file"},"action":"create"}}` + "\n" +
+		`{"type":"outputs","outputs":{"big":"` + strings.Repeat("x", 4<<10) + `"}}` + "\n" +
+		`{"type":"apply_complete","hook":{"resource":{"addr":"module.web.conn3x_file.motd[\"a\"]","resource_type":"conn3x_file"},"action":"create","elapsed_seconds":1}}` + "\n"
+	if err := os.WriteFile(stream, []byte(lines), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "run.json")
+	err := writeApplyReport(path, stream, time.Now(), true)
+	var long runreport.LongLines
+	if !errors.As(err, &long) || long != 1 {
+		t.Fatalf("err = %v, want one long line reported", err)
+	}
+	got, readErr := os.ReadFile(path)
+	if readErr != nil || !strings.Contains(string(got), `"status": "ok"`) || !strings.Contains(string(got), `"success": true`) {
+		t.Fatalf("the report wasn't written from the rest of the stream (%v):\n%s", readErr, got)
 	}
 }
 

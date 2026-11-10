@@ -12,7 +12,9 @@ function Test-ADFolders($paths) {
   foreach ($p in @(@($paths) | Where-Object { $_ } | Select-Object -Unique)) {
     Assert-PlainPath $p
     Lock-Folders ([IO.Path]::GetDirectoryName($p)) -Strict
-    if (Stat-Path $p) {
+    $there = Open-In ([IO.Path]::GetFileName($p)) 0x80 7
+    if ($there) {
+      $there.Dispose()
       Assert-AdminOnly $p -Folder -Inherited -Runner 'Active Directory'
       # Held and admin-only now, so nothing new can appear; what's already
       # inside could belong to anyone, with rules of its own.

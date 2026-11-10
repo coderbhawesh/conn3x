@@ -14,7 +14,7 @@ function Invoke-Msiexec([string]$line) {
 # Save-Download downloads into $file, following up to five redirects itself so
 # none can drop from https to http unless that's allowed, and stops at $max
 # bytes. A partial file is left for the caller to delete.
-function Save-Download([string]$url, [string]$file, [long]$max, [bool]$allowHttp) {
+function Save-Download([string]$url, $out, [long]$max, [bool]$allowHttp) {
   [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
   $uri = New-Object Uri($url)
   for ($hop = 0; $hop -le 5; $hop++) {
@@ -49,7 +49,6 @@ function Save-Download([string]$url, [string]$file, [long]$max, [bool]$allowHttp
     if ($code -ne 200) { $res.Close(); throw "the download failed with HTTP $code" }
     if ($res.ContentLength -gt $max) { $res.Close(); throw "the download is $($res.ContentLength) bytes, more than max_size_mb allows" }
     $in = $res.GetResponseStream()
-    $out = [IO.File]::Open($file, 'CreateNew', 'Write', 'None')
     try {
       $buf = New-Object byte[] 65536
       $total = [long]0
@@ -58,7 +57,7 @@ function Save-Download([string]$url, [string]$file, [long]$max, [bool]$allowHttp
         if ($total -gt $max) { throw "the download is more than max_size_mb allows" }
         $out.Write($buf, 0, $n)
       }
-    } finally { $out.Dispose(); $in.Dispose(); $res.Close() }
+    } finally { $in.Dispose(); $res.Close() }
     return
   }
   throw 'the download redirected more than five times'
@@ -69,38 +68,56 @@ if (-not $A.present) {
 } else {
   # Packages wait in a folder only SYSTEM and Administrators can write to, and
   # whose folders on the way nobody else can rename or replace.
-  $own = New-Security ([Security.AccessControl.DirectorySecurity]) @(
+  $admins = @(
     @{ principal = 'S-1-5-18'; mask = 0x1F01FF; flags = 3; allow = $true },
     @{ principal = 'S-1-5-32-544'; mask = 0x1F01FF; flags = 3; allow = $true })
+  $own = New-Security ([Security.AccessControl.DirectorySecurity]) $admins
   $dir = Join-Path $env:ProgramData 'Conn3x'
-  Lock-Folders $dir -Create -Strict $own
   $stage = Join-Path $dir 'packages'
-  Lock-Folders $stage -Create -Strict $own
-  Assert-Folder $stage (Hold-Path $stage)
-  # What a run that died left behind. A file another run still holds can't be
-  # deleted, and stays.
-  foreach ($f in [IO.Directory]::GetFiles($stage)) { try { [IO.File]::Delete($f) } catch { } }
-  $file = Join-Path $stage ([guid]::NewGuid().ToString('N') + '.msi')
+  # A folder that was already there has whatever rules it was made with, such
+  # as ProgramData's, which let any user add to it. So each gets these rules
+  # again, through its held handle. Reapplying them to a new one changes nothing.
+  foreach ($d in $dir, $stage) {
+    Lock-Folders $d -Create -Strict $own
+    Assert-Folder $d $script:folder
+    Set-Rules $script:folder $true $admins $true $false $null
+  }
+  $leaf = [guid]::NewGuid().ToString('N') + '.msi'
+  $file = Join-Path $stage $leaf
+  # Made in the held folder, not by its name, with the same access as a temp
+  # file in apply_file.ps1 but shared for reading.
+  $made = [Conn3xFs]::OpenIn($script:folder, $leaf, 0x17019F, 0, 2, 0x40, $null)
+  $out = New-Object IO.FileStream($made, [IO.FileAccess]::ReadWrite)
   try {
-    if ($A.url) {
-      Save-Download ([string]$A.url) $file ([long]$A.max_bytes) ([bool]$A.allow_http)
-    } else {
-      $in = [IO.File]::Open([string]$A.source, 'Open', 'Read', 'Read')
-      try {
-        $out = [IO.File]::Open($file, 'CreateNew', 'Write', 'None')
-        try { $in.CopyTo($out) } finally { $out.Dispose() }
-      } finally { $in.Dispose() }
-    }
+    try {
+      # Someone who opened the folder while they could still write to it could
+      # have made it a junction while it was empty. With our file in it, not any more.
+      Assert-NotLink $stage (Get-Info $script:folder)
+      # What a run that died left behind. A file another run still holds can't
+      # be deleted, and stays. Only now: with a file of ours in it the folder
+      # can't be turned into a junction, so its name still means this folder.
+      foreach ($f in [IO.Directory]::GetFiles($stage)) { if ($f -ne $file) { try { [IO.File]::Delete($f) } catch { } } }
+      if ($A.url) {
+        Save-Download ([string]$A.url) $out ([long]$A.max_bytes) ([bool]$A.allow_http)
+      } else {
+        $in = [IO.File]::Open([string]$A.source, 'Open', 'Read', 'Read')
+        try { $in.CopyTo($out) } finally { $in.Dispose() }
+      }
+      $out.Flush($true)
+    } finally { $out.Dispose() }
     # From here until msiexec is done, this handle lets others read the file
     # but not change, rename or delete it: what was hashed is what installs.
-    $held = [IO.File]::Open($file, 'Open', 'Read', 'Read')
+    # FILE_GENERIC_READ, shared for reading.
+    $held = New-Object IO.FileStream((Open-In $leaf 0x120089 1), [IO.FileAccess]::Read)
     try {
       $sum = ([BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($held))).Replace('-', '').ToLowerInvariant()
       if ($sum -ne $A.sha256) { throw "the package's SHA-256 is $sum, not $($A.sha256) as configured; nothing was installed" }
       $code = Invoke-Msiexec ('/i "' + $file + '" /qn /norestart ' + $A.properties)
     } finally { $held.Dispose() }
   } finally {
-    if ([IO.File]::Exists($file)) { [IO.File]::Delete($file) }
+    # DELETE, through the held folder.
+    $gone = Open-In $leaf 0x10080 7
+    if ($gone) { try { [Conn3xFs]::Remove($gone) } finally { $gone.Dispose() } }
   }
 }
 

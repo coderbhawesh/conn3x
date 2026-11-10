@@ -10,6 +10,7 @@
 package lint
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hclsyntax"
+	"github.com/zclconf/go-cty/cty"
 )
 
 // Severity is how a finding counts: an error fails the run, a warning
@@ -43,6 +45,7 @@ var (
 	ListenAll        = Rule{"C3X003", "listen-all", Error}
 	PrivilegedShell  = Rule{"C3X004", "privileged-shell", Error}
 	CommandGuard     = Rule{"C3X101", "command-guard", Warning}
+	ModuleConnection = Rule{"C3X102", "module-connection", Warning}
 	BadIgnore        = Rule{"C3X900", "ignore", Error}
 )
 
@@ -50,7 +53,7 @@ var (
 var Rules = map[string]Rule{}
 
 func init() {
-	for _, r := range []Rule{DownloadChecksum, ImageDigest, ListenAll, PrivilegedShell, CommandGuard, BadIgnore} {
+	for _, r := range []Rule{DownloadChecksum, ImageDigest, ListenAll, PrivilegedShell, CommandGuard, ModuleConnection, BadIgnore} {
 		Rules[r.ID] = r
 	}
 }
@@ -117,36 +120,86 @@ func insecureCredential(line string) bool {
 }
 
 // Dir lints every .hcl, .tf and .sh file under dir, leaving out examples/
-// and test/ as the grader does.
+// and test/ as the grader does, except a directory in them that a module
+// block in the linted code calls: that code runs with the circuit. The
+// modules dir calls, installed ones included, are also checked for
+// connection settings of their own (C3X102).
 func Dir(dir string) ([]Finding, error) {
 	var findings []Finding
-	err := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		rel, _ := filepath.Rel(dir, path)
-		rel = filepath.ToSlash(rel)
-		if d.IsDir() {
-			switch d.Name() {
-			case ".git", ".terraform", "node_modules":
-				return filepath.SkipDir
-			}
-			if rel == "examples" || rel == "test" {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		ext := filepath.Ext(path)
-		if ext != ".hcl" && ext != ".tf" && ext != ".sh" {
-			return nil
-		}
+	linted := map[string]bool{} // files linted, by path
+	var called []string         // local module directories, as module blocks name them
+	lintFile := func(path string) error {
 		src, err := os.ReadFile(path)
 		if err != nil {
 			return err
 		}
+		linted[path] = true
 		findings = append(findings, File(path, src)...)
+		for _, source := range moduleSources(path, src) {
+			called = append(called, filepath.Join(filepath.Dir(path), source))
+		}
 		return nil
-	})
+	}
+	walk := func(root string, skipTop bool) error {
+		return filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			rel, _ := filepath.Rel(dir, path)
+			rel = filepath.ToSlash(rel)
+			if d.IsDir() {
+				switch d.Name() {
+				case ".git", ".terraform", "node_modules":
+					return filepath.SkipDir
+				}
+				if skipTop && (rel == "examples" || rel == "test") {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if ext := filepath.Ext(path); (ext != ".hcl" && ext != ".tf" && ext != ".sh") || linted[path] {
+				return nil
+			}
+			return lintFile(path)
+		})
+	}
+	err := walk(dir, true)
+	// called grows as the modules found call others.
+	seen := map[string]bool{}
+	for i := 0; err == nil && i < len(called); i++ {
+		mod := called[i]
+		if seen[mod] {
+			continue
+		}
+		seen[mod] = true
+		if st, statErr := os.Stat(mod); statErr != nil || !st.IsDir() {
+			continue // the loader reports a module that isn't there
+		}
+		rel, relErr := filepath.Rel(dir, mod)
+		rel = filepath.ToSlash(rel)
+		inside := relErr == nil && rel != ".." && !strings.HasPrefix(rel, "../")
+		if inside && (strings.HasPrefix(rel+"/", "examples/") || strings.HasPrefix(rel+"/", "test/")) {
+			err = walk(mod, false)
+		}
+		if err == nil && mod != filepath.Clean(dir) {
+			var found []Finding
+			found, err = moduleConnections(mod)
+			findings = append(findings, found...)
+		}
+	}
+	if err == nil {
+		for _, mod := range installedModules(dir) {
+			if seen[mod] {
+				continue
+			}
+			seen[mod] = true
+			var found []Finding
+			if found, err = moduleConnections(mod); err != nil {
+				break
+			}
+			findings = append(findings, found...)
+		}
+	}
 	sort.SliceStable(findings, func(i, j int) bool {
 		a, b := findings[i], findings[j]
 		if a.File != b.File {
@@ -155,6 +208,160 @@ func Dir(dir string) ([]Finding, error) {
 		return a.Line < b.Line
 	})
 	return findings, err
+}
+
+// moduleSources are the local directories the module blocks in one file
+// call, as written: the sources that start with ./ or ../.
+func moduleSources(path string, src []byte) []string {
+	if ext := filepath.Ext(path); ext != ".hcl" && ext != ".tf" {
+		return nil
+	}
+	f, diags := hclsyntax.ParseConfig(src, path, hcl.InitialPos)
+	if diags.HasErrors() {
+		return nil // the loader reports syntax errors
+	}
+	var out []string
+	for _, blk := range f.Body.(*hclsyntax.Body).Blocks {
+		if blk.Type != "module" || blk.Body.Attributes["source"] == nil {
+			continue
+		}
+		v, diags := blk.Body.Attributes["source"].Expr.Value(nil)
+		if diags.HasErrors() || v.IsNull() || !v.IsKnown() || v.Type() != cty.String {
+			continue
+		}
+		if s := v.AsString(); strings.HasPrefix(s, "./") || strings.HasPrefix(s, "../") {
+			out = append(out, filepath.FromSlash(s))
+		}
+	}
+	return out
+}
+
+// installedModules are the directories of the modules conn3x init fetched
+// for dir, from its record of them.
+func installedModules(dir string) []string {
+	src, err := os.ReadFile(filepath.Join(dir, ".terraform", "modules", "modules.json"))
+	if err != nil {
+		return nil
+	}
+	var manifest struct {
+		Modules []struct{ Key, Dir string }
+	}
+	if json.Unmarshal(src, &manifest) != nil {
+		return nil
+	}
+	var out []string
+	for _, m := range manifest.Modules {
+		if m.Key != "" && m.Dir != "" && !filepath.IsAbs(m.Dir) {
+			out = append(out, filepath.Join(dir, filepath.FromSlash(m.Dir)))
+		}
+	}
+	return out
+}
+
+// connectionSettings are what, in an ssh block, says where to connect and
+// as whom. A module you call that sets one itself, instead of taking it
+// from you, connects with it when you plan.
+var connectionSettings = []string{"host", "host_key", "private_key_file", "become_password_file", "known_hosts_file", "ssh_config_file", "jump_hosts"}
+
+// moduleConnections checks the .hcl and .tf files directly in a called
+// module's directory for connection settings it gives itself: one in an ssh
+// block, or a circuit's hosts, that doesn't come from a variable or from
+// each.value. A local is followed back to what it is built from, so a
+// filter of var.hosts is the caller's and a literal behind a local is not.
+func moduleConnections(mod string) ([]Finding, error) {
+	entries, err := os.ReadDir(mod)
+	if err != nil {
+		return nil, err
+	}
+	bodies := map[string]*hclsyntax.Body{}
+	locals := map[string]hclsyntax.Expression{}
+	var paths []string
+	for _, e := range entries {
+		path := filepath.Join(mod, e.Name())
+		if ext := filepath.Ext(path); e.IsDir() || (ext != ".hcl" && ext != ".tf") {
+			continue
+		}
+		src, err := os.ReadFile(path)
+		if err != nil {
+			return nil, err
+		}
+		f, diags := hclsyntax.ParseConfig(src, path, hcl.InitialPos)
+		if diags.HasErrors() {
+			continue // the loader reports syntax errors
+		}
+		body := f.Body.(*hclsyntax.Body)
+		bodies[path] = body
+		paths = append(paths, path)
+		for _, blk := range body.Blocks {
+			if blk.Type == "locals" {
+				for name, attr := range blk.Body.Attributes {
+					locals[name] = attr.Expr
+				}
+			}
+		}
+	}
+	// fromCaller reports whether a value is made of what the caller gave: it
+	// names a variable, each or count, directly or through locals, and no
+	// local on the way is the module's own literal.
+	var fromCaller func(expr hclsyntax.Expression, seen map[string]bool) bool
+	fromCaller = func(expr hclsyntax.Expression, seen map[string]bool) bool {
+		found := false
+		for _, t := range expr.Variables() {
+			switch t.RootName() {
+			case "var", "each", "count":
+				found = true
+			case "local":
+				name := ""
+				if len(t) > 1 {
+					if step, ok := t[1].(hcl.TraverseAttr); ok {
+						name = step.Name
+					}
+				}
+				if locals[name] == nil || seen[name] {
+					return false
+				}
+				// seen holds the locals being followed right now, so only a
+				// local defined by itself stops here, not one used twice.
+				seen[name] = true
+				ok := fromCaller(locals[name], seen)
+				delete(seen, name)
+				if !ok {
+					return false
+				}
+				found = true
+			}
+		}
+		return found
+	}
+	var out []Finding
+	for _, path := range paths {
+		add := func(attr *hclsyntax.Attribute, what string) {
+			if fromCaller(attr.Expr, map[string]bool{}) {
+				return
+			}
+			r := attr.SrcRange
+			out = append(out, Finding{Rule: ModuleConnection, File: path, Line: r.Start.Line, Column: r.Start.Column,
+				Message: "this module, which your configuration calls, " + what + " itself instead of taking it from you, and connects with it when you plan; read it before you run it"})
+		}
+		var walk func(b *hclsyntax.Body)
+		walk = func(b *hclsyntax.Body) {
+			for _, blk := range b.Blocks {
+				if blk.Type == "circuit" && blk.Body.Attributes["hosts"] != nil {
+					add(blk.Body.Attributes["hosts"], "names its hosts")
+				}
+				if blk.Type == "ssh" {
+					for _, name := range connectionSettings {
+						if attr := blk.Body.Attributes[name]; attr != nil {
+							add(attr, "sets "+name+" in an ssh block")
+						}
+					}
+				}
+				walk(blk.Body)
+			}
+		}
+		walk(bodies[path])
+	}
+	return out, nil
 }
 
 // File lints one file's source. Its extension decides which rules apply.

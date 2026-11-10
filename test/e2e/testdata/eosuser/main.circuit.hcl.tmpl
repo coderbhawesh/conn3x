@@ -23,6 +23,14 @@ circuit "people" {
       ssh_key     = "{{.Key}}"
     }
   }
+
+  step "keyonly" {
+    eos_user {
+      name    = "c3xkey"
+      role    = "network-operator"
+      ssh_key = "{{.Key}}"
+    }
+  }
 {{- if .DemoteLogin}}
 
   step "login" {

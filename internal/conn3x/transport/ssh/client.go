@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	gossh "golang.org/x/crypto/ssh"
@@ -543,7 +544,15 @@ func (c *Client) exec(ctx context.Context, cmd string, stdin []byte) (Result, er
 	}
 	defer c.done(session)
 
-	var stdout, stderr bytes.Buffer
+	// A host that prints without end mustn't fill the controller's memory:
+	// past MaxOutput the command is killed.
+	var over atomic.Bool
+	stop := sync.OnceFunc(func() {
+		over.Store(true)
+		_ = session.Signal(gossh.SIGKILL)
+		session.Close()
+	})
+	stdout, stderr := capped{stop: stop}, capped{stop: stop}
 	session.Stdout = &stdout
 	session.Stderr = &stderr
 	session.Stdin = bytes.NewReader(stdin)
@@ -560,7 +569,10 @@ func (c *Client) exec(ctx context.Context, cmd string, stdin []byte) (Result, er
 		session.Close()
 		return Result{}, ctx.Err()
 	case err := <-done:
-		res := Result{Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}
+		if over.Load() {
+			return Result{}, fmt.Errorf("ssh %s: the command printed more than %d MiB, the most conn3x reads from one command on a host", c.addr, MaxOutput>>20)
+		}
+		res := Result{Stdout: stdout.buf.Bytes(), Stderr: stderr.buf.Bytes()}
 		var exitErr *gossh.ExitError
 		switch {
 		case err == nil:
@@ -653,7 +665,34 @@ func (p *Process) Close() error {
 	return nil
 }
 
-// syncBuffer is a bytes.Buffer safe to write and read at the same time.
+// MaxOutput is the most Run and RunRaw keep of a command's standard output,
+// and of its standard error. It leaves room for the largest file the agent
+// returns, 255 MiB, in base64.
+var MaxOutput = 384 << 20
+
+// capped is a buffer that calls stop, once, when a write would take it
+// past MaxOutput, and keeps nothing more.
+type capped struct {
+	buf  bytes.Buffer
+	stop func()
+}
+
+func (c *capped) Write(p []byte) (int, error) {
+	if c.buf.Len()+len(p) > MaxOutput {
+		c.stop()
+		return 0, errors.New("output limit reached")
+	}
+	return c.buf.Write(p)
+}
+
+// maxProcessStderr is the most a Process keeps of its command's standard
+// error, which is read for a sudo prompt and for what a failure said. A
+// refusal can come after a long login banner, so it's well past any real
+// one.
+const maxProcessStderr = 16 << 20
+
+// syncBuffer is a bytes.Buffer safe to write and read at the same time. It
+// keeps the first maxProcessStderr bytes and drops the rest.
 type syncBuffer struct {
 	mu  sync.Mutex
 	buf bytes.Buffer
@@ -662,6 +701,10 @@ type syncBuffer struct {
 func (b *syncBuffer) Write(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if room := maxProcessStderr - b.buf.Len(); room < len(p) {
+		b.buf.Write(p[:max(room, 0)])
+		return len(p), nil
+	}
 	return b.buf.Write(p)
 }
 

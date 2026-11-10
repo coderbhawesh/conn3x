@@ -134,6 +134,13 @@ func planWithPassword(req providers.PlanResourceChangeRequest, kind string, sett
 // planPassword is planWithPassword, planning the rest with plan.
 func planPassword(req providers.PlanResourceChangeRequest, kind string, settings []string,
 	plan func(providers.PlanResourceChangeRequest, string, []string, []string) providers.PlanResourceChangeResponse) providers.PlanResourceChangeResponse {
+	return planPasswordAs(req, kind, settings, plan, passwordHMAC)
+}
+
+// planPasswordAs is planPassword with sum as what password_hmac records.
+func planPasswordAs(req providers.PlanResourceChangeRequest, kind string, settings []string,
+	plan func(providers.PlanResourceChangeRequest, string, []string, []string) providers.PlanResourceChangeResponse,
+	sum func(key []byte, id, password string) string) providers.PlanResourceChangeResponse {
 	if req.ProposedNewState.IsNull() {
 		return providers.PlanResourceChangeResponse{PlannedState: req.ProposedNewState}
 	}
@@ -160,7 +167,7 @@ func planPassword(req providers.PlanResourceChangeRequest, kind string, settings
 			host = conn.GetAttr("host")
 		}
 		if wo.IsKnown() && known(vals["name"]) && known(host) {
-			vals["password_hmac"] = cty.StringVal(passwordHMAC(key, passwordID(kind, host.AsString(), vals["name"].AsString()), wo.AsString()))
+			vals["password_hmac"] = cty.StringVal(sum(key, passwordID(kind, host.AsString(), vals["name"].AsString()), wo.AsString()))
 		}
 	}
 	req.ProposedNewState = cty.ObjectVal(vals)

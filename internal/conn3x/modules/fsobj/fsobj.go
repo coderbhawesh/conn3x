@@ -37,7 +37,8 @@ const notDirectory = 3
 // ReadDirectory reports the directory's state. Something else at the path
 // is an error, never silently replaced.
 func ReadDirectory(ctx context.Context, r modules.Runner, p string) (DirectoryState, error) {
-	script := fmt.Sprintf(`p=%s
+	script := modules.Settled + fmt.Sprintf(`p=%s
+route_settled "$p" || { echo missing; exit 0; }
 [ -e "$p" ] || [ -L "$p" ] || { echo missing; exit 0; }
 [ -d "$p" ] && [ ! -L "$p" ] || exit %d
 stat -c '%%a %%U %%G' -- "$p" 2>/dev/null || stat -f '%%Lp %%Su %%Sg' "$p"`, ssh.Quote(p), notDirectory)
@@ -76,26 +77,27 @@ func ApplyDirectory(ctx context.Context, r modules.Runner, d Directory) error {
 		return err
 	}
 	q := ssh.Quote(d.Path)
-	// A link is refused before anything acts on it. In a sticky directory a
-	// plain mkdir makes sure the directory is the one made here, not one
-	// someone else got in first with and could still swap.
-	cmds := []string{"p=" + q,
-		`[ ! -L "$p" ] || { echo "$p exists but is not a directory" >&2; exit 3; }`,
-		`if [ ! -e "$p" ]; then
-  mkdir -p -- "$(dirname -- "$p")"
-  if [ -k "$(dirname -- "$p")" ]; then mkdir -- "$p"; else mkdir -p -- "$p"; fi
-fi`,
-		`[ -d "$p" ] || { echo "$p exists but is not a directory" >&2; exit 3; }`,
+	// A link is refused before anything acts on it. In a sticky directory
+	// route_mkdir makes sure the directory is the one made here, or one nobody
+	// else can swap, so the checks that follow stay true. The owner goes
+	// last, and -h keeps a new owner from pointing the path somewhere else
+	// before the next line.
+	cmds := []string{modules.Settled + "p=" + q,
+		`if route_settled "$p"; then
+  [ ! -L "$p" ] || { echo "$p exists but is not a directory" >&2; exit 3; }
+  [ -e "$p" ] || route_mkdir "$p"
+else route_mkdir "$p"; fi`,
+		`[ -d "$p" ] && [ ! -L "$p" ] || { echo "$p exists but is not a directory" >&2; exit 3; }`,
 		"chmod -- " + file.NormalizeMode(d.Mode) + " " + q}
-	if d.Owner != "" {
-		cmds = append(cmds, "chown -- "+ssh.Quote(d.Owner)+" "+q)
-	}
 	if d.Group != "" {
-		cmds = append(cmds, "chgrp -- "+ssh.Quote(d.Group)+" "+q)
+		cmds = append(cmds, `[ -n "${CONN3X_ROUTE_OWN:-}" ] || chgrp -h -- `+ssh.Quote(d.Group)+" "+q)
+	}
+	if d.Owner != "" {
+		cmds = append(cmds, `[ -n "${CONN3X_ROUTE_OWN:-}" ] || chown -h -- `+ssh.Quote(d.Owner)+" "+q)
 	}
 	cmds = append(cmds, "if command -v restorecon >/dev/null 2>&1; then restorecon -- "+q+" 2>/dev/null || true; fi")
 	script := "set -e\n" + strings.Join(cmds, "\n")
-	return run(ctx, r, modules.GuardWrite(script, modules.Write{Owner: d.Owner, Group: d.Group}, modules.Follow(d.Path)))
+	return run(ctx, r, modules.GuardWrite(script, modules.Write{Owner: d.Owner, Group: d.Group, Path: d.Path}, modules.Follow(d.Path)))
 }
 
 // DeleteDirectory removes the directory only when it is empty, so removing
@@ -173,14 +175,14 @@ func ApplyLink(ctx context.Context, r modules.Runner, l Link) error {
 		return err
 	}
 	q := ssh.Quote(l.Path)
+	// The new link is made in a directory of its own, so nobody can have put
+	// something at its name first.
 	return run(ctx, r, modules.Guard(fmt.Sprintf(`set -e
-tmp=$(dirname -- %[1]s)/.conn3x-link.$$
-ln -s -- %[2]s "$tmp"
+tmp=$(mktemp -d "$(dirname -- %[1]s)/.conn3x-link.XXXXXX")
+trap 'rm -rf -- "$tmp"' EXIT
+ln -s -- %[2]s "$tmp/l"
 # -T replaces the old link itself instead of following it into a directory.
-if ! mv -fT -- "$tmp" %[1]s 2>/dev/null; then
-  rm -f -- "$tmp"
-  ln -sfn -- %[2]s %[1]s
-fi`, q, ssh.Quote(l.Target)), modules.Parent(l.Path)))
+mv -fT -- "$tmp/l" %[1]s 2>/dev/null || ln -sfn -- %[2]s %[1]s`, q, ssh.Quote(l.Target)), modules.Parent(l.Path)))
 }
 
 // DeleteLink removes the link, and refuses to remove anything that isn't one.

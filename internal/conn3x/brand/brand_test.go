@@ -136,3 +136,91 @@ func TestGenerateBrandsJSONVersion(t *testing.T) {
 		}
 	}
 }
+
+// generateFrom copies files of the real tree, by their path from its root,
+// into an empty one, generates its overlay and returns what the overlay has
+// for each: the rewritten copy, or the source when it needed no rewrite.
+func generateFrom(t *testing.T, files ...string) map[string]string {
+	t.Helper()
+	root, out := t.TempDir(), t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "cmd"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range files {
+		src, err := os.ReadFile(filepath.Join("../../..", f))
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := filepath.Join(root, f)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, src, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := Generate(root, out); err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, f := range files {
+		b, err := os.ReadFile(filepath.Join(out, f))
+		if os.IsNotExist(err) {
+			b, err = os.ReadFile(filepath.Join(root, f))
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		got[f] = string(b)
+	}
+	return got
+}
+
+// The magic strings of the external key provider and encryption method
+// protocols stay OpenTofu's, so a program written for OpenTofu still works.
+func TestGenerateKeepsEncryptionProtocolMagic(t *testing.T) {
+	got := generateFrom(t,
+		"internal/encryption/keyprovider/external/protocol.go",
+		"internal/encryption/method/external/protocol.go",
+		"internal/encryption/keyprovider/external/provider.go",
+		"internal/encryption/method/external/command.go",
+	)
+	for f, want := range map[string]string{
+		"internal/encryption/keyprovider/external/protocol.go": `const HeaderMagic = "OpenTofu-External-Key-Provider"`,
+		"internal/encryption/method/external/protocol.go":      `const Magic = "OpenTofu-External-Encryption-Method"`,
+	} {
+		if !strings.Contains(got[f], want) {
+			t.Errorf("%s no longer has %s", f, want)
+		}
+	}
+	for f, src := range got {
+		if strings.Contains(src, "Conn3x-External-") {
+			t.Errorf("%s renames the protocol's magic string", f)
+		}
+	}
+	if got := rewriteLiteral(`"OpenTofu expects the header OpenTofu-External-Key-Provider"`); got != `"Conn3x expects the header OpenTofu-External-Key-Provider"` {
+		t.Errorf("rewriteLiteral = %s", got)
+	}
+}
+
+// The plan renderer's multi-line strings and the text of errors and
+// warnings go through termsafe.Escape. An upstream change that moves the
+// patched lines fails here, not in a release.
+func TestGenerateEscapesHostText(t *testing.T) {
+	got := generateFrom(t,
+		"internal/command/jsonformat/computed/renderers/string.go",
+		"internal/command/jsonformat/computed/renderers/primitive.go",
+		"internal/command/format/diagnostic.go",
+	)
+	for f, wants := range map[string][]string{
+		"internal/command/format/diagnostic.go":                       {"func conn3xSafe(", "termsafe.Escape(diag.Description().Summary)", `"github.com/opentofu/opentofu/internal/conn3x/termsafe"`},
+		"internal/command/jsonformat/computed/renderers/string.go":    {"termsafe.Escape(strings.TrimSpace(str))", "func (e evaluatedString) conn3xLines() []string", `"github.com/opentofu/opentofu/internal/conn3x/termsafe"`},
+		"internal/command/jsonformat/computed/renderers/primitive.go": {"beforeLines := beforeString.conn3xLines()", "afterLines := afterString.conn3xLines()"},
+	} {
+		for _, want := range wants {
+			if !strings.Contains(got[f], want) {
+				t.Errorf("rewritten %s lacks %s", f, want)
+			}
+		}
+	}
+}

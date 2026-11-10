@@ -21,6 +21,9 @@ type taskAt struct {
 	reason string
 }
 
+// maxImports is how many files one conversion reads through import_tasks.
+const maxImports = 1000
+
 // importKeys are what an import_tasks may set and still be inlined. Any other
 // keyword, such as when, become or vars, would apply to every task it imports.
 var importKeys = map[string]bool{"name": true, "tags": true}
@@ -67,6 +70,9 @@ func (c *converter) importFile(n *yaml.Node, args map[string]*yaml.Node, file st
 			return "", nil, "sets " + k + " on import_tasks, which applies it to every task it imports; the converter can't translate that yet"
 		}
 	}
+	if neverTagged(mapping(n)["tags"]) {
+		return "", nil, neverReason
+	}
 	name := scalar(args["file"])
 	if raw := scalar(args["_raw"]); raw != "" && len(args) == 1 {
 		name = raw
@@ -98,13 +104,18 @@ func (c *converter) importFile(n *yaml.Node, args map[string]*yaml.Node, file st
 	case slices.Contains(stack, found[0]):
 		return "", nil, fmt.Sprintf("imports %s, which is already being imported, so it would never finish", found[0])
 	}
+	// A file can import another many times over, and that one the next, so
+	// the count is what bounds the work, not the depth.
+	if c.imports++; c.imports > maxImports {
+		return "", nil, fmt.Sprintf("is past the %d files one conversion imports; more than that is taken for imports that multiply", maxImports)
+	}
 	src, err := os.ReadFile(c.path(found[0]))
 	if err != nil {
 		return "", nil, fmt.Sprintf("imports %s, which can't be read: %s", found[0], err)
 	}
 	var doc yaml.Node
-	if err := yaml.Unmarshal(src, &doc); err != nil {
-		return "", nil, fmt.Sprintf("imports %s, which isn't valid YAML: %s", found[0], err)
+	if err := parse(src, &doc); err != nil {
+		return "", nil, fmt.Sprintf("imports %s, which can't be read as YAML: %s", found[0], err)
 	}
 	if len(doc.Content) == 0 {
 		return found[0], nil, ""

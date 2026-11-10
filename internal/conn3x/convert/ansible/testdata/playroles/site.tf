@@ -54,6 +54,7 @@ circuit "web_2" {
     become           = true
   }
 
+  # TODO(convert): Set mode if this file isn't meant to be 0644. The task set none, so Ansible left a file that was already there as it was; this step sets 0644.
   step "write_the_motd" {
     file {
       path    = "/etc/motd"

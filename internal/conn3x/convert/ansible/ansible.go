@@ -68,7 +68,7 @@ func ConvertWith(path string, opts Options) (Result, error) {
 		return Result{}, err
 	}
 	var doc yaml.Node
-	if err := yaml.Unmarshal(src, &doc); err != nil {
+	if err := parse(src, &doc); err != nil {
 		return Result{}, fmt.Errorf("%s: %w", path, err)
 	}
 	if len(doc.Content) == 0 || doc.Content[0].Kind != yaml.SequenceNode {
@@ -102,6 +102,7 @@ type converter struct {
 	// those being converted, to catch a role that depends on itself.
 	ran        map[string]bool
 	converting map[string]bool
+	imports    int               // files read through import_tasks so far
 	called     map[string]bool   // role directories a module calls
 	depsCalled bool              // set on a role's converter when its caller calls its dependencies
 	entry      map[string]string // set on a role's converter: the file each of tasks, vars, defaults and handlers starts from, when not main
@@ -109,6 +110,7 @@ type converter struct {
 	hostVars   map[string]bool // groups that still need a hosts variable
 	needUser   bool
 	playNoLog  bool   // the current play sets no_log to anything but false
+	playNever  bool   // the current play is tagged never
 	runAs      string // who the current play's tasks run as, as an expression; empty when it's open
 	otherUser  string // what in the current play makes Ansible run as someone a circuit wouldn't
 	// factsAfter marks the current play's tasks that a later task or handler
@@ -219,6 +221,16 @@ func (c *converter) play(name, hosts string, p map[string]*yaml.Node, node *yaml
 	c.playNoLog = n != nil && !noLogOff(n)
 	circuit := hclwrite.NewBlock("circuit", []string{name})
 	cb := circuit.Body()
+	c.playNever = neverTagged(p["tags"])
+	for _, k := range sortedKeys(p) {
+		switch {
+		case playKeys[k] || (k == "become_method" && scalar(p[k]) == "sudo"):
+		case k == "<<":
+			c.playIssue(cb, name, node, "merges in keys with <<, which the converter doesn't read, so the steps below are written without whatever they set")
+		default:
+			c.playIssue(cb, name, node, "sets "+k+", which the converter doesn't carry over, so the steps below are written as if the play didn't set it")
+		}
+	}
 	var group *Group
 	if c.inv != nil {
 		group = c.inv.Group(hosts)
@@ -247,6 +259,9 @@ func (c *converter) play(name, hosts string, p map[string]*yaml.Node, node *yaml
 
 	c.runAs = c.effectiveUser(p, group, become, ssh)
 	c.otherUser = playChangesUser(p, group, become)
+	if c.otherUser == "" {
+		c.otherUser = c.filesChangeUser(p, become)
+	}
 	vars := map[string]string{}
 	for k, v := range mapping(p["vars"]) {
 		if v.Kind == yaml.ScalarNode {
@@ -383,6 +398,34 @@ func (c *converter) steps(cb *hclwrite.Body, taskNodes, handlerNodes []*yaml.Nod
 	}
 }
 
+// playKeys are what a play may set and convert: the converter reads them, or
+// they change how Ansible gathers facts, orders hosts or stops on a failure,
+// and nothing about what a task does. Any other key is reported, so a play
+// with check_mode or connection: local doesn't quietly become live steps.
+var playKeys = map[string]bool{
+	"name": true, "hosts": true, "become": true, "become_user": true, "remote_user": true, "vars": true,
+	"roles": true, "handlers": true, "pre_tasks": true, "tasks": true, "post_tasks": true, "no_log": true, "tags": true,
+	"gather_facts": true, "gather_subset": true, "gather_timeout": true, "fact_path": true, "collections": true,
+	"strategy": true, "serial": true, "order": true, "max_fail_percentage": true, "any_errors_fatal": true,
+	"force_handlers": true, "throttle": true, "debugger": true, "diff": true,
+}
+
+// neverReason is why a task tagged never stays behind.
+const neverReason = "is tagged never, so Ansible runs it only when one of its tags is asked for, and a step would run on every apply"
+
+// neverTagged reports whether tags, a list or a comma-separated string,
+// holds never.
+func neverTagged(n *yaml.Node) bool {
+	for _, tags := range listOf(n) {
+		for _, tag := range strings.Split(tags, ",") {
+			if strings.TrimSpace(tag) == "never" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // handlerKeys are what a handler may set besides its module. A notify only
 // finds a handler by its name, so listen changes nothing.
 var handlerKeys = map[string]bool{"name": true, "listen": true, "tags": true, "no_log": true}
@@ -395,6 +438,10 @@ func (c *converter) handler(cb *hclwrite.Body, h *yaml.Node, vars map[string]str
 	hname := scalar(t["name"])
 	if c.hidesValues(h) {
 		c.issue(cb, hname, h, noLogReason)
+		return nil, ""
+	}
+	if c.playNever || neverTagged(t["tags"]) {
+		c.issue(cb, hname, h, neverReason)
 		return nil, ""
 	}
 	for _, k := range sortedKeys(t) {
@@ -506,6 +553,61 @@ func playChangesUser(p map[string]*yaml.Node, group *Group, become bool) string 
 	return ""
 }
 
+// userKeys find, in a variables file or ansible.cfg, the settings that change
+// who a play's tasks run as. loginKeys only matter without become, as in
+// playChangesUser.
+var (
+	userKeys  = regexp.MustCompile(`(?m)^\s*(ansible_become_user|ansible_become|become_user)\s*[:=]`)
+	loginKeys = regexp.MustCompile(`(?m)^\s*(ansible_user|ansible_ssh_user|remote_user)\s*[:=]`)
+	// become in ansible.cfg is the default a play's own become overrides.
+	cfgBecome = regexp.MustCompile(`(?m)^\s*(become)\s*=`)
+)
+
+// filesChangeUser is playChangesUser for the files Ansible reads beside the
+// playbook: ansible.cfg, group_vars, host_vars and the play's vars_files. It
+// names the setting and its file, or returns "". The files are searched as
+// text, so a setting for one group counts for every play; a file the
+// converter can't read, such as a vault, counts as setting one.
+func (c *converter) filesChangeUser(p map[string]*yaml.Node, become bool) string {
+	var files []string
+	for _, name := range append([]string{"ansible.cfg", "group_vars", "host_vars"}, listOf(p["vars_files"])...) {
+		if strings.Contains(name, "{{") {
+			return "vars_files to a file named by a Jinja expression, which may set who tasks run as"
+		}
+		_ = filepath.WalkDir(c.path(name), func(path string, d os.DirEntry, err error) error {
+			if err == nil && !d.IsDir() {
+				files = append(files, path)
+			}
+			return nil
+		})
+	}
+	sort.Strings(files)
+	for _, f := range files {
+		rel, err := filepath.Rel(c.dir, f)
+		if err != nil {
+			rel = f
+		}
+		rel = filepath.ToSlash(rel)
+		src, err := os.ReadFile(f)
+		switch {
+		case err != nil:
+			return "who tasks run as, perhaps, in " + rel + ", which can't be read"
+		case strings.HasPrefix(string(src), "$ANSIBLE_VAULT"):
+			return "who tasks run as, perhaps, in " + rel + ", which is encrypted"
+		}
+		if m := userKeys.FindSubmatch(src); m != nil {
+			return string(m[1]) + " in " + rel
+		}
+		if m := loginKeys.FindSubmatch(src); m != nil && !become {
+			return string(m[1]) + " in " + rel
+		}
+		if m := cfgBecome.FindSubmatch(src); m != nil && p["become"] == nil {
+			return string(m[1]) + " in " + rel
+		}
+	}
+	return ""
+}
+
 // sameForAnyUser lists modules whose result on the host doesn't depend on who
 // ran them: they change the system, or name their user themselves. It lists
 // what is safe, so a module nobody thought about goes to review. known_hosts
@@ -558,6 +660,10 @@ func (c *converter) task(body *hclwrite.Body, node *yaml.Node, playBecome bool, 
 	name := scalar(t["name"])
 	if c.hidesValues(node) {
 		c.issue(body, name, node, noLogReason)
+		return
+	}
+	if c.playNever || neverTagged(t["tags"]) {
+		c.issue(body, name, node, neverReason)
 		return
 	}
 	if x, ok := c.role.defaultTask(node); ok {
@@ -880,12 +986,16 @@ func (c *converter) issue(body *hclwrite.Body, name string, node *yaml.Node, rea
 }
 
 // secretKey names arguments whose values are secrets, such as a password.
-var secretKey = regexp.MustCompile(`(?i)^(password|.*_password|.*_credential|.*_secret|.*_token)$`)
+// secretName matches such a name: one of these words as the whole name or
+// after an underscore. key alone isn't one, as authorized_key's is public.
+const secretName = `(?:\w*_)?(?:password|passwd|pass|passphrase|credential|credentials|secret|token|api_?key|private_key|access_key|secret_key)`
+
+var secretKey = regexp.MustCompile(`(?i)^` + secretName + `$`)
 
 const secretLeftOut = "(secret left out; see the playbook)"
 
 // secretArg is a key=value token whose key is a secret's, in free-form text.
-var secretArg = regexp.MustCompile(`(?i)(\b(?:password|\w*_password|\w*_credential|\w*_secret|\w*_token)=)("[^"]*"|'[^']*'|\S*)`)
+var secretArg = regexp.MustCompile(`(?i)(\b` + secretName + `=)("[^"]*"|'[^']*'|\S*)`)
 
 // hasAnchors reports whether a task uses YAML anchors or aliases anywhere.
 func hasAnchors(n *yaml.Node) bool {
@@ -1139,6 +1249,36 @@ func moduleOf(t map[string]*yaml.Node) (string, map[string]*yaml.Node) {
 
 // YAML helpers.
 
+// vaultMark stands in for a value encrypted with Ansible Vault, which the
+// converter can't read. It's a Jinja expression nothing fills in, so whatever
+// uses the value stays for review, and the ciphertext isn't taken for text.
+const vaultMark = "{{ encrypted with Ansible Vault }}"
+
+// parse reads YAML for the converter: every file it converts goes through
+// here. A NUL byte is refused, since the converter marks its own references
+// with them inside strings and must be able to tell those from the input.
+func parse(src []byte, doc *yaml.Node) error {
+	if err := yaml.Unmarshal(src, doc); err != nil {
+		return err
+	}
+	return vet(doc)
+}
+
+func vet(n *yaml.Node) error {
+	if strings.Contains(n.Value, "\x00") {
+		return fmt.Errorf("line %d has a NUL byte, which the converter doesn't accept anywhere in a file it reads", n.Line)
+	}
+	if n.Kind == yaml.ScalarNode && strings.HasPrefix(n.Tag, "!vault") {
+		n.Value = vaultMark
+	}
+	for _, c := range n.Content {
+		if err := vet(c); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func mapping(n *yaml.Node) map[string]*yaml.Node {
 	out := map[string]*yaml.Node{}
 	if n == nil || n.Kind != yaml.MappingNode {
@@ -1198,10 +1338,14 @@ func sortedKeys(m map[string]*yaml.Node) []string {
 
 // HCL helpers.
 
+// comment writes text as comment lines. Text often quotes the playbook, so
+// each of its lines gets its own #, or the rest would be read as HCL.
 func comment(body *hclwrite.Body, text string) {
-	body.AppendUnstructuredTokens(hclwrite.Tokens{
-		{Type: hclsyntaxComment, Bytes: []byte("# " + strings.TrimRight(text, " ") + "\n")},
-	})
+	for _, line := range strings.Split(strings.ReplaceAll(text, "\r", " "), "\n") {
+		body.AppendUnstructuredTokens(hclwrite.Tokens{
+			{Type: hclsyntaxComment, Bytes: []byte("# " + strings.TrimRight(line, " ") + "\n")},
+		})
+	}
 }
 
 func rawTokens(src string) hclwrite.Tokens {

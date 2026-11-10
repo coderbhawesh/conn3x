@@ -212,6 +212,34 @@ Set-Acl -LiteralPath $d -AclObject $acl`, nil)
 	}
 }
 
+// A staging folder made by hand has ProgramData's rules, which let any user
+// add files to it. It's used, and left for administrators only.
+func TestPackageLocksStagingFolderMadeByHand(t *testing.T) {
+	c := connect(t)
+	ctx := context.Background()
+	m := buildMSI(t, c, tempDir(t, c), false)
+	reset := `$d = Join-Path $env:ProgramData 'Conn3x'; if ([IO.Directory]::Exists($d)) { [IO.Directory]::Delete($d, $true) }`
+	t.Cleanup(func() {
+		_, _ = windows.ApplyPackage(context.Background(), c, windows.Package{ProductCode: m.Code, Absent: true}, 10*time.Minute)
+		_, _ = ps.User(context.Background(), c, reset, nil, time.Minute)
+	})
+	before := strings.TrimSpace(run(t, c, reset+`
+[void][IO.Directory]::CreateDirectory((Join-Path $d 'packages'))
+(Get-Acl -LiteralPath (Join-Path $d 'packages')).Sddl`, nil).Text)
+	if !strings.Contains(before, ";BU)") {
+		t.Skipf("ProgramData gives Users nothing to inherit here: %s", before)
+	}
+	if _, err := windows.ApplyPackage(ctx, c, windows.Package{ProductCode: m.Code, Source: m.Path, SHA256: m.SHA256}, 10*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range []string{`Conn3x`, `Conn3x\packages`} {
+		got := strings.TrimSpace(run(t, c, `param($A) (Get-Acl -LiteralPath (Join-Path $env:ProgramData $A.d)).GetSecurityDescriptorSddlForm('Access')`, map[string]any{"d": d}).Text)
+		if got != "D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)" {
+			t.Errorf("%s: %s", d, got)
+		}
+	}
+}
+
 // A package that asks for a restart reports it, and leaves the need where
 // windows_reboot looks.
 func TestPackageAsksForReboot(t *testing.T) {

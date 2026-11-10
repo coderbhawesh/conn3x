@@ -16,6 +16,7 @@ package report
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"io"
 	"sort"
 	"strings"
@@ -138,8 +139,56 @@ func Where(address string) (host, step, item string, ok bool) {
 	return host, mod + circuit + "." + s, item, true
 }
 
+// MaxLine is the longest line of a -json stream that's read. A longer one,
+// such as an output value of many megabytes, is passed over.
+var MaxLine = 16 << 20
+
+// LongLines is the error for a stream that had lines over MaxLine: how
+// many were passed over. Everything else in the stream was read.
+type LongLines int
+
+func (n LongLines) Error() string {
+	return fmt.Sprintf("%d line(s) of the run's JSON stream were over %d MiB and weren't read", int(n), MaxLine>>20)
+}
+
+// EachLine calls fn with each line of r, to its end. A line over MaxLine
+// is read past without being kept, so whatever writes r is never left
+// blocked, and is counted in the LongLines it returns.
+func EachLine(r io.Reader, fn func(line []byte)) error {
+	br := bufio.NewReaderSize(r, 64*1024)
+	var line []byte
+	long, skipped := false, 0
+	for {
+		part, more, err := br.ReadLine()
+		if err != nil {
+			if err != io.EOF {
+				return err
+			}
+			if skipped > 0 {
+				return LongLines(skipped)
+			}
+			return nil
+		}
+		if !long && len(line)+len(part) > MaxLine {
+			long, line = true, line[:0]
+			skipped++
+		}
+		if !long {
+			line = append(line, part...)
+		}
+		if more {
+			continue
+		}
+		if !long {
+			fn(line)
+		}
+		long, line = false, line[:0]
+	}
+}
+
 // FromApply reads an apply's -json stream and fills in the steps, cloud
-// resources and errors. success is whether the apply exited 0.
+// resources and errors. success is whether the apply exited 0. A LongLines
+// error means the report is filled in from every line but the long ones.
 func (r *Report) FromApply(stream io.Reader, success bool) error {
 	type entry struct {
 		address, module, action string
@@ -159,9 +208,7 @@ func (r *Report) FromApply(stream io.Reader, success bool) error {
 		return e
 	}
 
-	sc := bufio.NewScanner(stream)
-	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
-	for sc.Scan() {
+	streamErr := EachLine(stream, func(line []byte) {
 		var msg struct {
 			Type   string `json:"type"`
 			Change struct {
@@ -175,13 +222,13 @@ func (r *Report) FromApply(stream io.Reader, success bool) error {
 			} `json:"hook"`
 			Diagnostic *jsonentities.Diagnostic `json:"diagnostic"`
 		}
-		if json.Unmarshal(sc.Bytes(), &msg) != nil {
-			continue
+		if json.Unmarshal(line, &msg) != nil {
+			return
 		}
 		switch msg.Type {
 		case "planned_change":
 			if msg.Change.Action == "noop" || msg.Change.Action == "read" {
-				continue
+				return
 			}
 			e := get(msg.Change.Resource.Addr)
 			e.action, e.module = msg.Change.Action, strings.TrimPrefix(msg.Change.Resource.ResourceType, "conn3x_")
@@ -200,7 +247,7 @@ func (r *Report) FromApply(stream io.Reader, success bool) error {
 		case "diagnostic":
 			d := msg.Diagnostic
 			if d == nil || d.Severity != jsonentities.DiagnosticSeverityError {
-				continue
+				return
 			}
 			// As the terminal printed it, without color.
 			text := strings.TrimSpace(format.DiagnosticPlainFromJSON(d, 0))
@@ -211,9 +258,9 @@ func (r *Report) FromApply(stream io.Reader, success bool) error {
 				}
 			}
 		}
-	}
-	if err := sc.Err(); err != nil {
-		return err
+	})
+	if _, long := streamErr.(LongLines); streamErr != nil && !long {
+		return streamErr
 	}
 
 	r.Success = success
@@ -246,7 +293,7 @@ func (r *Report) FromApply(stream io.Reader, success bool) error {
 			Changed: status == StatusOK && e.action != "noop", Status: status, Reason: reason, Seconds: e.seconds, Error: e.err,
 		})
 	}
-	return nil
+	return streamErr
 }
 
 // AddDrift records one drifted object; a circuit step's gets its host.

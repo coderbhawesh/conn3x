@@ -34,7 +34,7 @@ if (-not $A.allow_interpreter) {
     throw "$($A.execute) is $own, which runs code from its arguments: set allow_interpreter = true if every script it runs is admin-only"
   }
 }
-if ($A.working_directory) { Assert-AdminOnly ([string]$A.working_directory) -Folder }
+if ($A.working_directory) { Assert-AdminOnly ([string]$A.working_directory) -Folder -Contents }
 # Every full path in the arguments, as Go found them; Go refused anything it
 # couldn't read as one.
 foreach ($p in @($A.check_paths)) { if ($p) { Assert-Path ([string]$p) } }

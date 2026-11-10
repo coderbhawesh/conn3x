@@ -132,7 +132,7 @@ func TestReadsInsideAUsersHome(t *testing.T) {
 func TestPathsOwnedByAUser(t *testing.T) {
 	for _, image := range linuxImages {
 		t.Run(image, func(t *testing.T) {
-			h, _ := routeHost(t, image)
+			h, guard := routeHost(t, image)
 			check := func(p, want string) {
 				t.Helper()
 				if got := strings.TrimSpace(h.exec("", "stat", "-c", "%U:%G %a", p)); got != want {
@@ -184,7 +184,9 @@ func TestPathsOwnedByAUser(t *testing.T) {
 				t.Fatalf("a = %q", got)
 			}
 
-			// A service's directory, with a group the service isn't in.
+			// A service's directory, with a group the service isn't in, as the
+			// Red Hat valkey package ships /etc/valkey: the step runs as the
+			// service, and root gives the file its group afterwards.
 			h.exec("", "sh", "-c", "mkdir /etc/svc && chown alice:root /etc/svc && chmod 0750 /etc/svc")
 			w, out, code = routeApply(t, h, `file {
       path    = "/etc/svc/conf"
@@ -195,6 +197,61 @@ func TestPathsOwnedByAUser(t *testing.T) {
     }`)
 			clean(w, out, code)
 			check("/etc/svc/conf", "alice:root 640")
+			w, out, code = routeApply(t, h, `line {
+      path = "/etc/svc/conf"
+      line = "edited"
+    }`)
+			clean(w, out, code)
+			check("/etc/svc/conf", "alice:root 640")
+
+			// A directory of root's that one service account's group can
+			// write to, as Debian's bind9 ships /var/lib/bind: the step runs
+			// as that account, and root gives the file the owner asked for.
+			h.exec("", "sh", "-c", "groupadd -r zones && useradd -r -g zones -s /usr/sbin/nologin zones && mkdir /var/lib/zones && chgrp zones /var/lib/zones && chmod 0775 /var/lib/zones")
+			w, out, code = routeApply(t, h, `file {
+      path    = "/var/lib/zones/home.zone"
+      content = "managed\n"
+      owner   = "root"
+      group   = "zones"
+    }`)
+			clean(w, out, code)
+			check("/var/lib/zones/home.zone", "root:zones 644")
+			w, out, code = routeApply(t, h, `file {
+      path    = "/var/lib/zones/plain.zone"
+      content = "managed\n"
+    }`)
+			clean(w, out, code)
+			check("/var/lib/zones/plain.zone", "zones:zones 644")
+			// A second account in the group, and there is no one to run as.
+			h.exec("", "usermod", "-aG", "zones", "alice")
+			if _, out, code = routeApply(t, h, `file {
+      path    = "/var/lib/zones/two.zone"
+      content = "managed\n"
+    }`); code == 0 || !strings.Contains(strings.Join(strings.Fields(out), " "), "which more than one account has") {
+				t.Fatalf("two accounts in the group, exit %d:\n%s", code, out)
+			}
+			// /var/log is the one such directory root still works under, as
+			// Ubuntu ships it root:syslog: its own subdirectories are root's.
+			h.exec("", "sh", "-c", "chgrp zones /var/log && chmod 0775 /var/log && mkdir -p /var/log/app")
+			w, out, code = routeApply(t, h, `file {
+      path    = "/var/log/app/app.log"
+      content = "managed\n"
+    }`)
+			clean(w, out, code)
+			check("/var/log/app/app.log", "root:root 644")
+
+			// A path is walked as it is written: after a link, .. is the
+			// parent of where the link leads, not of the link.
+			h.exec("", "sh", "-c", routeReset+" && mkdir /srv/demo && ln -s /home/alice/d/e /srv/demo/cur")
+			h.exec("", "su", "alice", "-c", "mkdir -p /home/alice/d/e && ln -s /opt/guard /home/alice/d/conf")
+			before := guard()
+			_, out, _ = routeApply(t, h, `file {
+      path    = "/srv/demo/cur/../conf/app.conf"
+      content = "managed\n"
+    }`)
+			if got := guard(); got != before {
+				t.Fatalf("a path with .. after a link changed what alice can't reach:\n%s\napply said:\n%s", got, out)
+			}
 
 			// Links root made, and a directory directly under root's own.
 			h.exec("old\n", "sh", "-c", "cat > /etc/real.conf; ln -s real.conf /etc/rel.conf; ln -s /etc/real.conf /etc/abs.conf")

@@ -131,6 +131,7 @@ func TestTaskRefusesWritablePrograms(t *testing.T) {
 	open := `C:\c3open-` + randHex(4)
 	locked := `C:\c3locked-` + randHex(4)
 	adds := `C:\c3adds-` + randHex(4)
+	theirs := `C:\c3theirs-` + randHex(4)
 	run(t, c, `param($A)
 [void][IO.Directory]::CreateDirectory($A.open)
 $acl = Get-Acl -LiteralPath $A.open
@@ -148,23 +149,31 @@ $f = Join-Path $A.locked 'prog.exe'
 $fa = Get-Acl -LiteralPath $f
 $fa.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(([Security.Principal.SecurityIdentifier]'S-1-5-32-545'), 'Write', 'Allow')))
 Set-Acl -LiteralPath $f -AclObject $fa
+# An admin-only folder holding a file that still belongs to someone else.
+[void][IO.Directory]::CreateDirectory($A.theirs, $sec)
+$t = Join-Path $A.theirs 'left.dll'
+[IO.File]::WriteAllText($t, 'x')
+$ts = New-Object Security.AccessControl.FileSecurity
+$ts.SetOwner((New-Object Security.Principal.SecurityIdentifier 'S-1-5-32-545'))
+[IO.File]::SetAccessControl($t, $ts)
 # A folder where others may only add files: no swapping, but room for a DLL.
 $sec.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(([Security.Principal.SecurityIdentifier]'S-1-5-32-545'), 'CreateFiles', 'None', 'None', 'Allow')))
 [void][IO.Directory]::CreateDirectory($A.adds, $sec)
-[IO.File]::Copy('C:\Windows\System32\whoami.exe', (Join-Path $A.adds 'prog.exe'))`, map[string]any{"open": open, "locked": locked, "adds": adds})
+[IO.File]::Copy('C:\Windows\System32\whoami.exe', (Join-Path $A.adds 'prog.exe'))`, map[string]any{"open": open, "locked": locked, "adds": adds, "theirs": theirs})
 	t.Cleanup(func() {
-		_, _ = ps.User(context.Background(), c, `param($A) foreach ($d in $A.open, $A.locked, $A.adds) { if ([IO.Directory]::Exists($d)) { [IO.Directory]::Delete($d, $true) } }`, map[string]any{"open": open, "locked": locked, "adds": adds}, time.Minute)
+		_, _ = ps.User(context.Background(), c, `param($A) foreach ($d in $A.open, $A.locked, $A.adds, $A.theirs) { if ([IO.Directory]::Exists($d)) { [IO.Directory]::Delete($d, $true) } }`, map[string]any{"open": open, "locked": locked, "adds": adds, "theirs": theirs}, time.Minute)
 	})
 	for name, tc := range map[string]struct {
 		mod  func(*windows.Task)
 		want string
 	}{
-		"SYSTEM, open folder":         {func(tk *windows.Task) { tk.Execute = open + `\prog.exe` }, "S-1-5-11 can"},
-		"NETWORK SERVICE, open":       {func(tk *windows.Task) { tk.Execute, tk.User = open+`\prog.exe`, "NETWORK SERVICE" }, "S-1-5-11 can"},
-		"SYSTEM, writable file":       {func(tk *windows.Task) { tk.Execute = locked + `\prog.exe` }, "can change"},
-		"SYSTEM, open working folder": {func(tk *windows.Task) { tk.WorkingDirectory = open }, "S-1-5-11 can"},
-		"SYSTEM, others add files":    {func(tk *windows.Task) { tk.Execute = adds + `\prog.exe` }, "can add or replace files"},
-		"SYSTEM, missing program":     {func(tk *windows.Task) { tk.Execute = locked + `\none.exe` }, "doesn't exist"},
+		"SYSTEM, open folder":          {func(tk *windows.Task) { tk.Execute = open + `\prog.exe` }, "S-1-5-11 can"},
+		"NETWORK SERVICE, open":        {func(tk *windows.Task) { tk.Execute, tk.User = open+`\prog.exe`, "NETWORK SERVICE" }, "S-1-5-11 can"},
+		"SYSTEM, writable file":        {func(tk *windows.Task) { tk.Execute = locked + `\prog.exe` }, "can change"},
+		"SYSTEM, open working folder":  {func(tk *windows.Task) { tk.WorkingDirectory = open }, "S-1-5-11 can"},
+		"SYSTEM, another's file there": {func(tk *windows.Task) { tk.WorkingDirectory = theirs }, "belongs to S-1-5-32-545"},
+		"SYSTEM, others add files":     {func(tk *windows.Task) { tk.Execute = adds + `\prog.exe` }, "can add or replace files"},
+		"SYSTEM, missing program":      {func(tk *windows.Task) { tk.Execute = locked + `\none.exe` }, "doesn't exist"},
 	} {
 		tk := newTask(t, c)
 		tc.mod(&tk)

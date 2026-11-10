@@ -126,3 +126,126 @@ func TestDirSkipsExamplesAndTests(t *testing.T) {
 		t.Error("a warning alone shouldn't fail the run")
 	}
 }
+
+func write(t *testing.T, root string, files map[string]string) {
+	t.Helper()
+	for name, src := range files {
+		p := filepath.Join(root, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// examples/ and test/ are left out, except code in them that the circuit's
+// own code calls as a module, which runs with it.
+func TestDirLintsCalledCodeUnderExamplesAndTest(t *testing.T) {
+	dir := t.TempDir()
+	bad := "variable \"a\" {\n  default = \"0.0.0.0\"\n}\n"
+	write(t, dir, map[string]string{
+		"main.tf":                    "module \"helper\" {\n  source = \"./test/helper\"\n}\n",
+		"test/helper/variables.tf":   bad + "module \"deeper\" {\n  source = \"../../examples/deeper\"\n}\n",
+		"examples/deeper/main.tf":    bad,
+		"examples/basic/main.tf":     bad,
+		"test/fixture/variables.tf":  bad,
+		"examples/deeper/sub/x.tf":   bad,
+		".terraform/modules/x/x.tf":  bad,
+		"examples/deeper/.git/x.tf":  bad,
+		"test/helper/scripts/run.sh": "curl https://example.com/install | sh\n",
+	})
+	found, err := Dir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, f := range found {
+		rel, _ := filepath.Rel(dir, f.File)
+		got = append(got, filepath.ToSlash(rel)+" "+f.Rule.ID)
+	}
+	want := "examples/deeper/main.tf C3X003,examples/deeper/sub/x.tf C3X003,test/helper/scripts/run.sh C3X004,test/helper/variables.tf C3X003"
+	if strings.Join(got, ",") != want {
+		t.Errorf("findings:\n got %s\nwant %s", strings.Join(got, ","), want)
+	}
+}
+
+// A module the configuration calls, local or installed by init, that names
+// its own hosts or keys is reported: it connects with them at plan.
+func TestDirReportsConnectionSettingsInCalledModules(t *testing.T) {
+	dir := t.TempDir()
+	hostile := `circuit "c" {
+  hosts = ["203.0.113.9"]
+  ssh {
+    user                 = var.user
+    private_key_file     = "~/.ssh/id_ed25519"
+    become_password_file = "~/.sudo-password"
+  }
+}
+
+data "conn3x_host" "probe" {
+  ssh {
+    host     = local.hidden
+    host_key = "ssh-ed25519 AAAA"
+  }
+}
+
+locals {
+  hidden = "203.0.113.9"
+}
+`
+	// A local that only filters what the caller gave is the caller's, through
+	// as many locals as it takes and from another file.
+	honest := `circuit "dns" {
+  hosts = local.dns
+}
+
+locals {
+  dns  = { for name, h in local.linux : name => h if local.role[name] == "dns" }
+  role = { for name, h in local.linux : name => h.role }
+  loop = local.loop
+}
+
+circuit "c" {
+  hosts = var.hosts
+  ssh {
+    user             = var.ssh_user
+    private_key_file = var.ssh_private_key_file
+    host_key         = each.value.host_key
+  }
+}
+`
+	write(t, dir, map[string]string{
+		// The root's own literals are the operator's to write.
+		"main.circuit.hcl":                "circuit \"mine\" {\n  hosts = [\"192.0.2.1\"]\n  ssh {\n    private_key_file = \"~/.ssh/id\"\n  }\n}\n",
+		"main.tf":                         "module \"local\" {\n  source = \"./modules/local\"\n}\nmodule \"remote\" {\n  source = \"git::https://example.com/circuit-x?ref=v1\"\n}\nmodule \"honest\" {\n  source = \"./modules/honest\"\n}\nmodule \"mixed\" {\n  source = \"./modules/mixed\"\n}\n",
+		"modules/local/main.circuit.hcl":  hostile,
+		"modules/honest/main.circuit.hcl": honest,
+		"modules/honest/locals.tf":        "locals {\n  linux = { for name, h in var.hosts : name => h if h.os != \"windows\" }\n}\n",
+		// A literal anywhere on the way back is still the module's own.
+		"modules/mixed/main.circuit.hcl":      "circuit \"c\" {\n  hosts = local.picked\n}\nlocals {\n  picked = { for name, h in local.all : name => h }\n  all    = merge(var.hosts, local.extra)\n  extra  = { spare = \"203.0.113.9\" }\n}\n",
+		".terraform/modules/remote/x.tf":      hostile,
+		".terraform/modules/modules.json":     `{"Modules":[{"Key":"","Source":"","Dir":"."},{"Key":"remote","Source":"git::https://example.com/circuit-x?ref=v1","Dir":".terraform/modules/remote"},{"Key":"local","Source":"./modules/local","Dir":"modules/local"}]}`,
+		".terraform/modules/unlisted/main.tf": hostile,
+	})
+	found, err := Dir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := map[string]int{}
+	for _, f := range found {
+		if f.Rule != ModuleConnection {
+			t.Errorf("unexpected finding %s", f)
+			continue
+		}
+		rel, _ := filepath.Rel(dir, f.File)
+		count[filepath.ToSlash(rel)]++
+	}
+	if len(count) != 3 || count["modules/local/main.circuit.hcl"] != 5 || count[".terraform/modules/remote/x.tf"] != 5 || count["modules/mixed/main.circuit.hcl"] != 1 {
+		t.Errorf("C3X102 findings by file = %v, want 5 each in the local and the installed module, and 1 for the literal behind two locals", count)
+	}
+	if Failed(found) {
+		t.Error("C3X102 is a warning and shouldn't fail the run")
+	}
+}

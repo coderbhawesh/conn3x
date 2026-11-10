@@ -8,7 +8,8 @@ $old = $null
 $sec = $null
 $keep = $null # a plain rewrite's rules to restore after writing, when it may inherit
 if ($A.exact) { $sec = New-Security ([Security.AccessControl.FileSecurity]) $A.entries }
-$h = Open-NoFollow $path 0x20080 7
+$leaf = [IO.Path]::GetFileName($path)
+$h = Open-In $leaf 0x20080 7
 if ($h) {
   try {
     $old = Get-Info $h
@@ -39,21 +40,27 @@ if ($h) {
 # when a new file should simply inherit, and nothing else can open it while the
 # content is written. Rules set later would leave a restricted file's content
 # open to whoever can read the folder until then.
-$tmp = [IO.Path]::Combine($dir, '.conn3x-' + [guid]::NewGuid().ToString('N') + '.tmp')
-$stream = New-Object IO.FileStream($tmp, [IO.FileMode]::CreateNew, [Security.AccessControl.FileSystemRights]'Write,Read', [IO.FileShare]::None, 4096, [IO.FileOptions]::WriteThrough, $sec)
+#
+# One handle makes the temp file in the held folder, writes it, sets its rules,
+# renames it into place and, on failure, deletes it. Its name is never looked up
+# again: whoever can delete in the folder could otherwise empty it once the file
+# was closed, turn it into a junction, and have the rename or the clean-up land
+# wherever that points.
+$sd = $null
+if ($sec) { $sd = $sec.GetSecurityDescriptorBinaryForm() }
+# FILE_GENERIC_READ and FILE_GENERIC_WRITE, DELETE to rename or remove it, and
+# WRITE_DAC. No sharing. FILE_CREATE, so a file someone put at that name is
+# never taken for ours; FILE_WRITE_THROUGH and FILE_NON_DIRECTORY_FILE.
+$th = [Conn3xFs]::OpenIn($script:folder, '.conn3x-' + [guid]::NewGuid().ToString('N') + '.tmp', 0x17019F, 0, 2, 0x42, $sd)
+$stream = New-Object IO.FileStream($th, [IO.FileAccess]::ReadWrite)
 try {
   try {
-    # An empty folder could have become a junction before the temp file made it non-empty.
-    Assert-NotLink $dir (Stat-Path $dir)
     $bytes = [Convert]::FromBase64String($A.content)
     $stream.Write($bytes, 0, $bytes.Length)
     $stream.Flush($true)
-  } finally { $stream.Dispose() }
-  if ($keep) {
-    # Let the system apply the inheriting rules, so it marks the DACL
-    # auto-inherited as the original file was. Through a handle, not the name.
-    $th = Open-NoFollow $tmp 0x60080 7 # READ_CONTROL, WRITE_DAC, FILE_READ_DATA
-    try {
+    if ($keep) {
+      # Let the system apply the inheriting rules, so it marks the DACL
+      # auto-inherited as the original file was.
       $fs = New-Object Security.AccessControl.FileSecurity
       $fs.SetSecurityDescriptorSddlForm($keep, [Security.AccessControl.AccessControlSections]::Access)
       $raw = New-Object Security.AccessControl.RawSecurityDescriptor($fs.GetSecurityDescriptorBinaryForm(), 0)
@@ -62,10 +69,11 @@ try {
       # DACL plus UNPROTECTED_DACL, so Windows recomputes auto-inheritance. 1 is SE_FILE_OBJECT.
       $code = [Conn3xFs]::SetSecurityInfo($th, 1, [uint32]536870916, $null, $null, $dacl, $null)
       if ($code) { throw (New-Object ComponentModel.Win32Exception ([int]$code)) }
-    } finally { $th.Dispose() }
+    }
+    # One step, replacing a name, not following it.
+    [Conn3xFs]::RenameTo($th, $leaf)
+  } catch {
+    [Conn3xFs]::Remove($th)
+    throw
   }
-  # REPLACE_EXISTING and WRITE_THROUGH: one step, replacing a name, not following it.
-  if (-not [Conn3xFs]::MoveFileExW($tmp, $path, 9)) { throw (New-Object ComponentModel.Win32Exception) }
-} finally {
-  if ([IO.File]::Exists($tmp)) { [IO.File]::Delete($tmp) }
-}
+} finally { $stream.Dispose() }

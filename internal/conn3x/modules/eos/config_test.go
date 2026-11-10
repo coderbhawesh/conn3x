@@ -114,9 +114,28 @@ func TestConfigValidate(t *testing.T) {
 		{Lines: []string{"copy running-config startup-config"}},
 		{Parents: []string{"exit"}, Lines: []string{"x"}},
 		{Lines: []string{""}},
+		// Short forms EOS takes for the words above, and the words that
+		// run a command outside the session or empty it.
+		{Lines: []string{"conf t"}},
+		{Lines: []string{"wr"}},
+		{Lines: []string{"ex"}},
+		{Lines: []string{"EN"}},
+		{Lines: []string{"ab"}},
+		{Lines: []string{"do write"}},
+		{Lines: []string{"run bash"}},
+		{Lines: []string{"rollback clean-config"}},
+		{Parents: []string{"e"}, Lines: []string{"x"}},
+		{Lines: []string{"description a\x1bb"}},
+		{Lines: []string{"description a\tb"}},
+		{Lines: []string{"description a\x00"}},
 	} {
 		if err := c.Validate(); err == nil {
 			t.Errorf("%+v: no error", c)
+		}
+	}
+	for _, l := range []string{"control-plane", "router bgp 65000", "banner motd hello", "daemon x", "email from x@y", "errdisable recovery interval 30", "radius-server host 10.0.0.1", "dot1x system-auth-control"} {
+		if err := (Config{Lines: []string{l}}).Validate(); err != nil {
+			t.Errorf("%q: %v", l, err)
 		}
 	}
 	ok := Config{Parents: []string{"interface Ethernet1"}, Lines: []string{"description x"}, Match: MatchBlock}

@@ -4,7 +4,9 @@
 package sshkey
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -44,6 +46,16 @@ func TestReadRunsAsTheUser(t *testing.T) {
 	}
 	if !strings.Contains(cmd, "'/home/deploy/.ssh/authorized_keys'") {
 		t.Fatalf("read did not name the file:\n%s", cmd)
+	}
+}
+
+func TestReadStopsAtTheSizeLimit(t *testing.T) {
+	r := &recRunner{results: []ssh.Result{{Stdout: bytes.Repeat([]byte("x"), MaxRead+1)}}}
+	if _, err := Read(context.Background(), r, loc); err == nil || !strings.Contains(err.Error(), "is over 1 MiB") {
+		t.Fatalf("err = %v, want the size limit", err)
+	}
+	if want := fmt.Sprintf("head -c %d <", MaxRead+1); !strings.Contains(r.cmds[0], want) {
+		t.Fatalf("the read isn't bounded on the host with %q:\n%s", want, r.cmds[0])
 	}
 }
 

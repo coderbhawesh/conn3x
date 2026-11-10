@@ -31,9 +31,13 @@ step "breakglass" {
 <!-- reference -->
 ## How it works
 
-EOS stores a password as a salted hash, so Conn3x can only tell that an account has one, never which. It keeps an HMAC of `password_wo` in `password_hmac`, keyed outside state, and a new password plans a change through it. Changing the role or privilege keeps the password as it is on the switch. Leave `password_wo` unset to leave the password alone; a new account then gets none (`nopassword`), for key-only logins. A password can't hold spaces, since the EOS CLI would read the rest as more of the command.
+EOS stores a password as a salted hash. Conn3x works that hash out on your machine and sends the switch `secret sha512 <hash>`, so the password itself never reaches the switch's CLI or a config session. State keeps neither: `password_hmac` is an HMAC of the hash, keyed outside state. A new password plans a change through it, and every refresh compares the hash on the switch with it, so an account that holds another password shows as out of sync and the next apply sets yours. That covers an account that was on the switch before the step, a password changed by hand, and an apply that stopped before its commit. Changing the role or privilege keeps the password as it is on the switch. Leave `password_wo` unset to leave the password alone.
 
-Passwords and their hashes are masked in every log line and error Conn3x writes, the session diff included. OpenTofu itself logs its command line, so pass a password through a variable file or `TF_VAR_`, not `-var`.
+A new account without `password_wo` gets `secret *`, a secret no password matches, so it logs in with its SSH key only. EOS's own `nopassword` lets an account in with an empty password wherever the switch takes password logins, the console included, so Conn3x writes it only when you ask with `nopassword = true`. Set `nopassword = false` to close an account that has it. Conn3x up to v0.11.0 made key-only accounts with `nopassword`; a refresh warns about each one until you choose.
+
+Refreshing needs the HMAC key that made `password_hmac`. On a machine without it, a refresh can only tell that the account has a secret, not which.
+
+Hashes are masked in every log line and error Conn3x writes. The log lists the lines Conn3x added to the session, never the switch's own diff of it, which would show the config around them. OpenTofu itself logs its command line, so pass a password through a variable file or `TF_VAR_`, not `-var`.
 
 Conn3x won't lower the privilege or change the role of the account it logs in as, and won't delete it.
 

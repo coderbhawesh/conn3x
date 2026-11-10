@@ -544,11 +544,15 @@ func TestNoLogIsLeftForReview(t *testing.T) {
 			if strings.Contains(string(res.HCL), "hunter2") {
 				t.Fatalf("the secret reached the file:\n%s", res.HCL)
 			}
-			if res.Converted != 0 || len(res.Review) != 1 {
+			want := 1
+			if name == "play merge" {
+				want = 2 // the merge itself is reported too
+			}
+			if res.Converted != 0 || len(res.Review) != want {
 				t.Fatalf("converted %d, review %v", res.Converted, res.Review)
 			}
-			if tc.reason && !strings.Contains(res.Review[0].Reason, "write them to this file") {
-				t.Fatalf("reason: %q", res.Review[0].Reason)
+			if tc.reason && !strings.Contains(res.Review[want-1].Reason, "write them to this file") {
+				t.Fatalf("reason: %q", res.Review[want-1].Reason)
 			}
 			if !strings.Contains(string(res.HCL), "TODO(convert)") {
 				t.Fatalf("no TODO:\n%s", res.HCL)

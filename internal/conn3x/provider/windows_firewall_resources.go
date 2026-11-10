@@ -26,7 +26,7 @@ func winFirewallRuleSchema() providers.Schema {
 			"description":      {Type: cty.String, Optional: true, Description: "Description. Left as it is when unset."},
 			"direction":        {Type: cty.String, Optional: true, Description: "\"inbound\" (default) or \"outbound\"."},
 			"action":           {Type: cty.String, Optional: true, Description: "\"allow\" (default) or \"block\"."},
-			"protocol":         {Type: cty.String, Optional: true, Description: "\"tcp\", \"udp\", \"icmpv4\", \"icmpv6\" or \"any\" (default)."},
+			"protocol":         {Type: cty.String, Optional: true, Description: "\"tcp\", \"udp\", \"icmpv4\", \"icmpv6\" or \"any\" (default). An inbound allow rule with no local_ports and no remote_addresses must set it, so a rule that lets everything in is never made by leaving settings out."},
 			"local_ports":      {Type: cty.List(cty.String), Optional: true, Description: "Ports on this host, such as \"443\" or \"8000-8100\". Needs protocol \"tcp\" or \"udp\". Unset means any."},
 			"remote_addresses": {Type: cty.List(cty.String), Optional: true, Description: "Addresses the traffic comes from or goes to: IP addresses, subnets such as 10.0.0.0/8, ranges such as 10.0.0.1-10.0.0.9, or LocalSubnet. Unset means any."},
 			"profiles":         {Type: cty.List(cty.String), Optional: true, Description: "Network profiles the rule applies in: \"domain\", \"private\", \"public\". Unset means all."},
@@ -118,6 +118,10 @@ func validateWinFirewallRule(cfg cty.Value) tfdiags.Diagnostics {
 	f := winFirewallRuleFrom(cfg)
 	if err := f.Validate(); err != nil {
 		return diags.Append(attrError("name", err.Error()))
+	}
+	// With nothing but a name, Windows makes a rule that lets everything in.
+	if f.Direction == "inbound" && f.Action == "allow" && cfg.GetAttr("protocol").IsNull() && len(f.LocalPorts) == 0 && len(f.RemoteAddresses) == 0 {
+		return diags.Append(attrError("protocol", `this rule would allow all inbound traffic from anywhere. Set protocol and local_ports, or remote_addresses. To allow everything on purpose, set protocol = "any"`))
 	}
 	if err := winFirewallLockout(cfg, f); err != nil {
 		diags = diags.Append(attrError("action", err.Error()))

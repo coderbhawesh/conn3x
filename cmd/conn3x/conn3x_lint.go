@@ -11,6 +11,7 @@ import (
 
 	"github.com/opentofu/opentofu/internal/command"
 	"github.com/opentofu/opentofu/internal/conn3x/lint"
+	"github.com/opentofu/opentofu/internal/conn3x/termsafe"
 )
 
 func lintCommand() command.Command {
@@ -19,7 +20,7 @@ func lintCommand() command.Command {
 	cmd := command.Command{
 		Name:  "lint",
 		Short: "Check circuits for what the circuit grader marks down",
-		Long: `Reads the .hcl, .tf and .sh files in each directory (the current one by default), leaving out examples/ and test/, and reports one line per finding:
+		Long: `Reads the .hcl, .tf and .sh files in each directory (the current one by default), leaving out examples/ and test/ unless the circuit's own code calls a module there, and reports one line per finding:
 
   main.circuit.hcl:12:7: C3X001 download-checksum: download step has no sha256, ...
 
@@ -29,9 +30,12 @@ Rules:
   C3X003 listen-all         a default or literal that listens on every address
   C3X004 privileged-shell   shell that's wrong wherever it runs as root, such as curl | sh
   C3X101 command-guard      a command step with no creates, removes, unless or triggers (a warning)
+  C3X102 module-connection  a module you call that names its own hosts, or sets a host, key or password file in an ssh block (a warning)
   C3X900 ignore             an ignore with no reason, or one that matches nothing
 
 C3X001 to C3X004 are the circuit grader's checks of a circuit's own code, with the same patterns, so a circuit that lints clean passes them.
+
+A circuit you add with a module block is code you run: its ssh block and its data sources connect when you plan. C3X102 reads the modules your configuration calls, the ones conn3x init fetched included, and reports connection settings they give themselves instead of taking from you. Read a shared circuit before you use it, and pin its ref to a commit, since a tag can be moved.
 
 To keep a finding you've looked at, say why on its line or the line above:
 
@@ -57,7 +61,7 @@ func runLint(dirs []string, asJSON bool, stdout, stderr io.Writer) int {
 	for _, d := range dirs {
 		found, err := lint.Dir(d)
 		if err != nil {
-			fmt.Fprintf(stderr, "Error: %s\n", err)
+			fmt.Fprintf(stderr, "Error: %s\n", termsafe.Escape(err.Error()))
 			return 1
 		}
 		all = append(all, found...)
@@ -74,7 +78,8 @@ func runLint(dirs []string, asJSON bool, stdout, stderr io.Writer) int {
 		}
 	} else {
 		for _, f := range all {
-			fmt.Fprintln(stdout, f.String())
+			// A finding quotes the circuit's own text.
+			fmt.Fprintln(stdout, termsafe.Escape(f.String()))
 		}
 	}
 	if lint.Failed(all) {

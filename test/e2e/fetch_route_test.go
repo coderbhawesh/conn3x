@@ -45,6 +45,14 @@ func TestArchiveStaysInDest(t *testing.T) {
 		_, _ = fw.Write([]byte(e.body))
 	}
 	zw.Close()
+	var subZip bytes.Buffer
+	zw = zip.NewWriter(&subZip)
+	if fw, err := zw.Create("sub/new"); err != nil {
+		t.Fatal(err)
+	} else {
+		_, _ = fw.Write([]byte("x\n"))
+	}
+	zw.Close()
 	var linkBuf, ownBuf bytes.Buffer
 	for _, b := range []struct {
 		w     *bytes.Buffer
@@ -103,6 +111,15 @@ func TestArchiveStaysInDest(t *testing.T) {
 				if got := guard(); got != want {
 					t.Fatalf("%s changed what's outside dest:\n%s", c[0], got)
 				}
+			}
+
+			// A directory of alice's is unpacked into as alice, wherever
+			// creates is: unzip goes through a link she has put there.
+			h.exec(subZip.String(), "sh", "-c", "cat > /tmp/s.zip; mkdir /srv/app; chown alice /srv/app")
+			h.exec("", "su", "alice", "-c", "ln -s /opt/guard /srv/app/sub")
+			_, out, _ := routeApply(t, h, step("/tmp/s.zip", "/srv/app", "/srv/unpacked"))
+			if got := guard(); got != want {
+				t.Fatalf("unpacking into alice's directory changed what she can't reach:\n%s\napply said:\n%s", got, out)
 			}
 
 			h.exec("", "sh", "-c", "mkdir -m 0750 /opt/d4")

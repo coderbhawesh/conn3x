@@ -4,6 +4,7 @@
 package main
 
 import (
+	"errors"
 	"reflect"
 	"slices"
 	"strings"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/opentofu/opentofu/internal/command"
 	"github.com/opentofu/opentofu/internal/conn3x/provider"
+	runreport "github.com/opentofu/opentofu/internal/conn3x/report"
 )
 
 func TestDriftIsACommand(t *testing.T) {
@@ -235,5 +237,39 @@ func TestConvertNeedsPlaybook(t *testing.T) {
 	var out, errOut strings.Builder
 	if code := runConvert("", "", "", &out, &errOut); code != 1 || !strings.Contains(errOut.String(), "playbook path is required") {
 		t.Fatalf("exit %d: %q", code, errOut.String())
+	}
+}
+
+// A line too long to read is read past, so the plan is never left blocked
+// on a full pipe, and drift says it can't vouch for the result.
+func TestReadDriftReadsPastALongLine(t *testing.T) {
+	saved := runreport.MaxLine
+	runreport.MaxLine = 1 << 10
+	defer func() { runreport.MaxLine = saved }()
+	stream := `{"type":"outputs","outputs":{"big":"` + strings.Repeat("x", 1<<20) + `"}}` + "\n" +
+		`{"type":"resource_drift","change":{"resource":{"addr":"conn3x_file.a","resource_type":"conn3x_file"},"action":"update"}}` + "\n"
+	left := strings.NewReader(stream)
+	r, err := readDrift(left)
+	var long runreport.LongLines
+	if !errors.As(err, &long) || left.Len() != 0 {
+		t.Fatalf("err = %v with %d bytes unread, want a long line reported and the stream drained", err, left.Len())
+	}
+	if len(r.hosts) != 1 {
+		t.Errorf("the line after the long one wasn't read: %+v", r)
+	}
+}
+
+// What a host or a circuit put in an error or an address can't repaint the
+// operator's terminal.
+func TestDriftReportEscapesControlCharacters(t *testing.T) {
+	r, err := readDrift(strings.NewReader(`{"type":"diagnostic","diagnostic":{"severity":"error","summary":"reading /etc/motd","detail":"host said \u001b[2J\u001b[Hall fine"}}` + "\n" +
+		`{"type":"resource_drift","change":{"resource":{"addr":"conn3x_file.a[\"k\u001b[1A\"]","resource_type":"conn3x_file"},"action":"update"}}` + "\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out strings.Builder
+	r.write(&out)
+	if strings.Contains(out.String(), "\x1b") || !strings.Contains(out.String(), `host said \x1b[2J\x1b[Hall fine`) || !strings.Contains(out.String(), `k\x1b[1A`) {
+		t.Errorf("drift printed:\n%q", out.String())
 	}
 }

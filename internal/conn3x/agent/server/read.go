@@ -36,6 +36,11 @@ func readFile(path string) (*agentpb.FileStat, error) {
 		}
 		return nil, &os.PathError{Op: "lstat", Path: path, Err: err}
 	}
+	if os.Geteuid() == 0 && ls.Uid != 0 && ls.Mode&syscall.S_IFMT == syscall.S_IFLNK {
+		// It wasn't there for checkRoute, which would have refused it: someone
+		// made it since, in a directory anyone can create in.
+		return nil, errRoute(path)
+	}
 	var st syscall.Stat_t
 	if err := syscall.Stat(path, &st); err != nil {
 		if ls.Mode&syscall.S_IFMT == syscall.S_IFLNK {

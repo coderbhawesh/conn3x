@@ -32,7 +32,7 @@ func TestEditsToOneFileTakeTurns(t *testing.T) {
 			defer wg.Done()
 			h := &hostConn{runner: moduletest.Local{}, rootKey: "web1"}
 			l := edit.Line{Line: fmt.Sprintf("k%d=%d", i, i)}
-			errs <- editFile(context.Background(), h, path, true, func(s string) (string, error) { return edit.ApplyLine(s, l) })
+			errs <- editFile(context.Background(), h, path, path, true, func(s string) (string, error) { return edit.ApplyLine(s, l) })
 		}()
 	}
 	wg.Wait()
@@ -100,7 +100,7 @@ func TestEditsWriteThroughLinksAndKeepTheMode(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := editFile(ctx, h, target, false, tc.k.edit(v)); err != nil {
+			if err := editFile(ctx, h, target, v.GetAttr("path").AsString(), false, tc.k.edit(v)); err != nil {
 				t.Fatal(err)
 			}
 			if fi, err := os.Lstat(link); err != nil || fi.Mode()&os.ModeSymlink == 0 {
@@ -175,5 +175,20 @@ func TestEditValidation(t *testing.T) {
 		if diags.HasErrors() == tc.ok {
 			t.Errorf("%s: diags %v", name, diags)
 		}
+	}
+}
+
+// An edit of a path someone else owns the way to is theirs to do, whatever
+// file their side says the path leads to: root never writes on their word.
+func TestEditFileGoesTheWayOfTheStepsPath(t *testing.T) {
+	dir := moduletest.RootDir(t)
+	moduletest.Sh(t, dir, "mkdir theirs; chown nobody theirs; echo kept > roots; chmod 0644 roots")
+	h := &hostConn{runner: moduletest.Local{}, rootKey: "web1"}
+	err := editFile(context.Background(), h, dir+"/roots", dir+"/theirs/link", false, func(string) (string, error) { return "changed\n", nil })
+	if err == nil {
+		t.Error("the edit went through")
+	}
+	if got := moduletest.Sh(t, dir, "cat roots; stat -c %U roots"); got != "kept\nroot" {
+		t.Fatalf("root's file is now %q", got)
 	}
 }

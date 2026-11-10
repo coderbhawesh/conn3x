@@ -73,10 +73,17 @@ func TestGenerateContent(t *testing.T) {
 		"no newline":   {cty.StringVal("x"), false, []string{`content = "x"`}, "<<EOT"},
 		"EOT inside":   {cty.StringVal("a\nEOT\nb\n"), false, []string{`content = "a\nEOT\nb\n"`}, "<<EOT"},
 		"indented EOT": {cty.StringVal("a\n  EOT\nb\n"), false, []string{`content = "a\n  EOT\nb\n"`}, "<<EOT"},
-		"binary":       {cty.StringVal("\xff\xfe"), false, []string{"isn't UTF-8", `content_wo = "REPLACE ME"`}, "content ="},
-		"large":        {cty.StringVal(strings.Repeat("x", maxContent+1)), false, []string{"over 64 KiB", `content_wo = "REPLACE ME"`}, "xxx"},
-		"write-only":   {cty.NullVal(cty.String), true, []string{"stayed on the host", `content_wo = "REPLACE ME"`}, ""},
-		"no content":   {cty.NullVal(cty.String), false, nil, "content"},
+		// A terminal hides escape sequences and leaves them out of copied
+		// text, so "$<escape>{" would paste as a live "${".
+		"escape in ${":  {cty.StringVal("ok\n$\x1b[m{file(\"/etc/hostname\")}\n"), false, []string{`content = "ok\n$\u001b[m{file`}, "<<EOT"},
+		"escape in EOT": {cty.StringVal("ok\nEO\x1b[mT\nimport = false\n"), false, []string{`content = "ok\nEO\u001b[mT\n`}, "<<EOT"},
+		"bidi control":  {cty.StringVal("a \u202e b\n"), false, []string{`content = "a \u202e b\n"`}, "<<EOT"},
+		"carriage ret":  {cty.StringVal("a\rb\n"), false, []string{`content = "a\rb\n"`}, "<<EOT"},
+		"tabs":          {cty.StringVal("a\tb\n"), false, []string{"<<EOT\n", "a\tb\n"}, ""},
+		"binary":        {cty.StringVal("\xff\xfe"), false, []string{"isn't UTF-8", `content_wo = "REPLACE ME"`}, "content ="},
+		"large":         {cty.StringVal(strings.Repeat("x", maxContent+1)), false, []string{"over 64 KiB", `content_wo = "REPLACE ME"`}, "xxx"},
+		"write-only":    {cty.NullVal(cty.String), true, []string{"was left out", `content_wo = "REPLACE ME"`}, ""},
+		"no content":    {cty.NullVal(cty.String), false, nil, "content"},
 	} {
 		got := render(tc.content, tc.writeOnly)
 		for _, w := range tc.want {

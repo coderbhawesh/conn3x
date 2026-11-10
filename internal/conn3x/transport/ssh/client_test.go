@@ -106,6 +106,26 @@ func TestRunCapturesOutputAndExit(t *testing.T) {
 	}
 }
 
+// A command that prints past MaxOutput is killed and reported, and the
+// connection still serves the next command.
+func TestRunStopsAtTheOutputLimit(t *testing.T) {
+	saved := MaxOutput
+	MaxOutput = 64 << 10
+	defer func() { MaxOutput = saved }()
+	s := sshtest.New(t)
+	c := dial(t, testConfig(t, s))
+	if _, err := c.Run(context.Background(), "head -c 4194304 /dev/zero", nil); err == nil || !strings.Contains(err.Error(), "printed more than") {
+		t.Fatalf("a flood of output: err = %v, want the limit named", err)
+	}
+	if _, err := c.Run(context.Background(), "head -c 4194304 /dev/zero >&2", nil); err == nil || !strings.Contains(err.Error(), "printed more than") {
+		t.Fatalf("a flood of errors: err = %v, want the limit named", err)
+	}
+	res, err := c.Run(context.Background(), "head -c 65536 /dev/zero", nil)
+	if err != nil || len(res.Stdout) != MaxOutput {
+		t.Fatalf("output at the limit: %d bytes, err = %v", len(res.Stdout), err)
+	}
+}
+
 func TestRunSetsCLocale(t *testing.T) {
 	s := sshtest.New(t)
 	c := dial(t, testConfig(t, s))

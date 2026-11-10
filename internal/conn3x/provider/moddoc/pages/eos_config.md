@@ -26,11 +26,13 @@ Since v0.10.0, the steps for a switch share one session per apply. Each step add
 The plan shows two more lines per switch. `conn3x_eos_commit.<circuit>__commit` changes only when one of the circuit's `eos_*` steps does. `conn3x_eos_removals.<circuit>__removals` does nothing until you destroy the circuit, and then it commits every removal in one go: seven VLAN steps came off cEOS-lab in 13.2 seconds instead of about 70. A few things follow from sharing:
 
 - If any step fails, the whole session is aborted, the steps before it included, and nothing on that switch changes.
+- The session belongs to the switch, not the circuit. When two circuits in one configuration have steps on the same switch, the first circuit to finish commits what both have added so far. If the other circuit then fails, its lines from before that commit stay live, and the error says so.
+- If the apply stops before the commit for any other reason, Conn3x aborts the session as it exits.
 - A lockout rolls back the whole batch: every step of that apply on the switch, not only the one that cut Conn3x off.
 - EOS commits a session by swapping running-config for the session's copy. So if someone edits the switch by hand while the apply is adding lines, Conn3x refuses to commit rather than undo the edit. Nothing changes; apply again.
 - `-target` on a single `eos_*` step leaves the commit out, and the staged lines are dropped when the run ends. Target `conn3x_eos_commit.<circuit>__commit` instead: it brings every step with it.
 - A step you take out of a circuit that stays still commits its removal on its own, after the circuit's commit.
-- Conn3x forgets a removed step as soon as its removal is in the session. So if that session goes nowhere, because a later line was refused or someone changed the switch mid-apply, Conn3x commits the removals again in a session of their own, and the error says it did. Only if that fails too, or another run holds the switch, does the error list lines for you to take off by hand.
+- Conn3x forgets a removed step as soon as its removal is in the session. So if that session goes nowhere, because a later line was refused or someone changed the switch mid-apply, Conn3x commits the removals again in a session of their own, and the error says it did. Only if that fails too, or another run holds the switch, does the error list lines for you to take off by hand. The same goes for an apply that stops before the commit: the removals are committed as Conn3x exits, and if that fails the run ends with an error that lists them.
 - A circuit applied by an older Conn3x has no `__removals` yet. The next apply adds it; until then, destroy pays the wait once per removal.
 - Two runs at one switch at once can't both win. The second one aborts the first one's session, and the first run stops with an error saying so, with nothing of it live.
 
@@ -78,4 +80,5 @@ step "mgmt_acl" {
   Conn3x never types `enable`: on a switch with an enable password, `enable` would read the next line of the change as the password. Without the `aaa` line, every step fails and says so.
 - EOS has no shell and no sudo, so `become` and `agent` are refused in the circuit's `ssh` block. Log in with a key; password login isn't supported yet.
 - A line the switch rewrites, such as `int et1` for `interface Ethernet1`, never matches, and the step shows as changed on every plan. Copy lines from `show running-config`.
-- Don't put secrets in `lines`: they'd be stored in state. Write-only lines are planned for a later release.
+- A line can't leave or end the config session, so `end`, `exit`, `configure`, `write`, `copy`, `commit`, `abort`, `reload`, `bash`, `enable`, `disable`, `do`, `run` and `rollback` are refused as a line's first word, and so is any short form of them, such as `conf t` or `wr`. EOS would take the short form for the command, and the lines after it would go live outside the session and its revert timer. Control characters are refused too.
+- Don't put secrets in `lines`: they'd be stored in state. Write-only lines are planned for a later release. In logs and errors Conn3x hides what follows `secret`, `password`, `key`, `key-string`, `community`, `auth` and `priv` on a line.

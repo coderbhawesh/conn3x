@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 // node is one line of a running-config and the lines indented under it.
@@ -114,23 +115,41 @@ func (c Config) Validate() error {
 	return nil
 }
 
+// sessionWords are the commands that leave or end a config session, run
+// something outside it ("do", "run", "bash"), or throw its config away
+// ("rollback clean-config").
+var sessionWords = []string{"end", "exit", "abort", "commit", "configure", "copy", "write", "reload", "bash", "enable", "disable", "do", "run", "rollback"}
+
+// hasControl reports whether s holds a control character, a tab included:
+// a CLI line is sent as typed, and a terminal or the CLI may act on one.
+func hasControl(s string) bool {
+	return strings.ContainsFunc(s, unicode.IsControl)
+}
+
 // checkLine refuses what would change mode or end the session early: a
-// line is sent to the device as typed.
+// line is sent to the device as typed. EOS takes any unambiguous start of a
+// command for the command, so "conf t" and "wr" are refused with
+// "configure" and "write": on cEOS-lab 4.37.0F, the lines after a "conf t"
+// went live at once, outside the session and its revert timer.
 func checkLine(l string) error {
 	t := strings.TrimSpace(l)
 	switch {
 	case t == "":
 		return errors.New("lines and parents must not be empty strings")
-	case t != l:
-		return fmt.Errorf("line %q has leading or trailing spaces; write it the way show running-config prints it, without the indent", l)
 	case strings.ContainsAny(l, "\r\n"):
 		return fmt.Errorf("line %q must be a single line", l)
+	case hasControl(l):
+		return fmt.Errorf("line %q holds a control character; write it with printable characters and spaces only", l)
+	case t != l:
+		return fmt.Errorf("line %q has leading or trailing spaces; write it the way show running-config prints it, without the indent", l)
 	case strings.HasPrefix(t, "!"):
 		return fmt.Errorf("line %q is a comment; leave it out", l)
 	}
-	switch strings.Fields(strings.ToLower(t))[0] {
-	case "end", "exit", "abort", "commit", "configure", "copy", "write", "reload", "bash", "enable", "disable":
-		return fmt.Errorf("line %q would leave or end the config session; Conn3x opens, commits and saves the session itself", l)
+	first := strings.ToLower(strings.Fields(t)[0])
+	for _, w := range sessionWords {
+		if strings.HasPrefix(w, first) {
+			return fmt.Errorf("line %q would leave or end the config session, as %q or a short form of it; Conn3x opens, commits and saves the session itself. Write a line the way show running-config prints it, in full", l, w)
+		}
 	}
 	return nil
 }
@@ -191,7 +210,7 @@ func (v VLAN) Validate() error {
 	if v.ID < 1 || v.ID > 4094 {
 		return fmt.Errorf("vlan_id must be between 1 and 4094, not %d", v.ID)
 	}
-	if strings.ContainsAny(v.Name, " \t\r\n") || len(v.Name) > 32 {
+	if strings.ContainsAny(v.Name, " ") || hasControl(v.Name) || len(v.Name) > 32 {
 		return errors.New("name must be one word of at most 32 characters")
 	}
 	return nil

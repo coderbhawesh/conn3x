@@ -21,6 +21,7 @@ type fakeSwitch struct {
 	name     string
 	sent     *[]string
 	refuse   string
+	refuseOn string  // when set, what a script must hold to be refused, with refuse as the switch's words
 	down     bool    // every command fails, as on a connection that's gone
 	running  *string // show running-config; nil is ""
 	sessions string  // show configuration sessions | json; "" is the conn3x sessions it was sent
@@ -39,9 +40,12 @@ func track(sent *[]string, what string) {
 	if opened[sent] == nil {
 		opened[sent] = map[string]any{}
 	}
-	if len(f) > 3 && (f[3] == "abort" || f[3] == "commit") {
+	switch {
+	case len(f) > 3 && (f[3] == "abort" || f[3] == "commit"):
 		delete(opened[sent], f[2])
-	} else {
+	case len(f) > 4 && f[3] == "description":
+		opened[sent][f[2]] = map[string]string{"state": "pending", "description": f[4]}
+	case opened[sent][f[2]] == nil: // entering a session that's there keeps it
 		opened[sent][f[2]] = map[string]string{"state": "pending"}
 	}
 }
@@ -59,13 +63,16 @@ func (f fakeSwitch) RunRaw(ctx context.Context, cmd string, stdin []byte) (ssh.R
 	if f.down {
 		return ssh.Result{}, errors.New("connection lost")
 	}
-	if f.refuse != "" && strings.Contains(what, f.refuse) {
+	if f.refuseOn != "" && strings.Contains(what, f.refuseOn) {
+		return ssh.Result{Stdout: []byte("\n> " + what + "\n" + f.refuse + "\n"), ExitCode: 1}, nil
+	}
+	if f.refuseOn == "" && f.refuse != "" && strings.Contains(what, f.refuse) {
 		return ssh.Result{Stdout: []byte("\n> " + f.refuse + "\n% Invalid input at line 2\n"), ExitCode: 1}, nil
 	}
 	switch {
 	case strings.HasSuffix(cmd, " diffs"):
 		return ssh.Result{Stdout: []byte("+hostname leaf1\n")}, nil
-	case cmd == "show configuration sessions | json":
+	case cmd == "show configuration sessions | json", cmd == "show configuration sessions detail | json":
 		if f.sessions == "" {
 			b, _ := json.Marshal(map[string]any{"sessions": opened[f.sent], "maxOpenSessions": 5})
 			return ssh.Result{Stdout: b}, nil
@@ -99,7 +106,7 @@ func TestApplyCommitsConfirmsAndSaves(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if diff != "+hostname leaf1\n" {
+	if diff != "hostname leaf1" {
 		t.Errorf("diff = %q", diff)
 	}
 	if len(sent) != 8 {
@@ -109,9 +116,9 @@ func TestApplyCommitsConfirmsAndSaves(t *testing.T) {
 	want := []string{
 		"pool: show configuration sessions | json",
 		"pool: configure session " + name + " / hostname leaf1 / end",
-		"pool: show configuration sessions | json",
+		"pool: configure session " + name + " description " + name,
+		"pool: show configuration sessions detail | json",
 		"pool: show running-config",
-		"pool: show session-config named " + name + " diffs",
 		"pool: configure session " + name + " commit timer 00:05:00",
 		"fresh: configure session " + name + " commit",
 		"pool: copy running-config startup-config",
@@ -402,9 +409,89 @@ func TestMask(t *testing.T) {
 		"username bob privilege 15 role network-admin nopassword":   "username bob privilege 15 role network-admin nopassword",
 		"username carol ssh-key ssh-ed25519 AAAAC3Nza carol@laptop": "username carol ssh-key ssh-ed25519 AAAAC3Nza carol@laptop",
 		"enable password 0 letmein":                                 "enable password <hidden>",
+		"snmp-server community s3cr3t ro":                           "snmp-server community <hidden>",
+		"   ip ospf authentication-key 7 045802150C2E":              "   ip ospf authentication-key <hidden>",
+		"   ip ospf message-digest-key 1 md5 7 045802150C2E":        "   ip ospf message-digest-key <hidden>",
+		"   key-string 7 0110100A480E0A0E":                          "   key-string <hidden>",
+		"ntp authentication-key 1 sha1 7 06120A3258":                "ntp authentication-key <hidden>",
+		"snmp-server user ops grp v3 auth sha 0a1b2c priv aes 3d4e": "snmp-server user ops grp v3 auth <hidden>",
+		"   shared-secret 7 0110100A480E":                           "   shared-secret <hidden>",
+		"aaa authentication login default local":                    "aaa authentication login default local",
+		"username bob nopassword\nhostname leaf1":                   "username bob nopassword\nhostname leaf1",
 	} {
 		if got := Mask(in); got != want {
 			t.Errorf("Mask(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// The switch's own words about a refused line must not carry the line's
+// secret, wherever it quotes it.
+func TestRefusalDoesNotQuoteTheSecret(t *testing.T) {
+	var sent []string
+	d := fakeSwitch{name: "pool", sent: &sent, refuse: "% Invalid input (at token 3: 's3cr3t') at line 2"}
+	d.refuseOn = "s3cr3t"
+	s, _ := Open(context.Background(), d, "")
+	err := s.Add(context.Background(), d, []string{"snmp-server community s3cr3t ro"})
+	if err == nil || strings.Contains(err.Error(), "s3cr3t") || !strings.Contains(err.Error(), "at token 3: '<hidden>'") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+// The log gets the lines the session added, masked, not the switch's diff,
+// whose context lines are whatever config sits around the change.
+func TestCommitReturnsTheLinesAdded(t *testing.T) {
+	var sent []string
+	d := fakeSwitch{name: "pool", sent: &sent}
+	s, _ := Open(context.Background(), d, "")
+	for _, l := range []string{"vlan 10", "username bob secret sha512 $6$abc$def"} {
+		if err := s.Add(context.Background(), d, []string{l}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	lines, err := s.Commit(context.Background(), d, reconnectTo(d, nil), time.Millisecond)
+	if err != nil || lines != "vlan 10\nusername bob secret <hidden>" {
+		t.Errorf("lines %q, err %v", lines, err)
+	}
+	for _, c := range sent {
+		if strings.Contains(c, " diffs") {
+			t.Errorf("asked the switch for its diff: %q", c)
+		}
+	}
+}
+
+// aborting is a switch on which someone aborts the session just before a
+// script goes in, after Add's check: the script starts the session again.
+type aborting struct {
+	fakeSwitch
+	on *bool
+}
+
+func (a aborting) RunRaw(ctx context.Context, cmd string, stdin []byte) (ssh.Result, error) {
+	if name, ok := strings.CutPrefix(strings.SplitN(string(stdin), "\n", 2)[0], "configure session "); ok && cmd == "" && *a.on {
+		*a.on = false
+		track(a.sent, "configure session "+name+" abort")
+	}
+	return a.fakeSwitch.RunRaw(ctx, cmd, stdin)
+}
+
+// A session aborted between Add's check and its lines comes back holding
+// those lines only. It must not be committed as if it held the earlier ones.
+func TestSessionStartedAgainIsNotCommitted(t *testing.T) {
+	var sent []string
+	on := false
+	d := aborting{fakeSwitch{name: "pool", sent: &sent}, &on}
+	s, _ := Open(context.Background(), d, "")
+	if err := s.Add(context.Background(), d, []string{"vlan 10"}); err != nil {
+		t.Fatal(err)
+	}
+	on = true
+	err := s.Add(context.Background(), d, []string{"vlan 20"})
+	if !errors.As(err, new(SessionGoneError)) {
+		t.Fatalf("Add into a session started again: err = %v", err)
+	}
+	sent = nil
+	if err := s.Abort(context.Background(), d); err != nil || len(sent) != 1 || !strings.HasSuffix(sent[0], s.Name+" abort") {
+		t.Errorf("the session started again wasn't aborted: err %v, sent %q", err, sent)
 	}
 }

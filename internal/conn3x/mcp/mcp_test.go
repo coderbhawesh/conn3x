@@ -18,7 +18,7 @@ import (
 // exchange sends lines to a server with Tools and returns its responses by id.
 func exchange(t *testing.T, lines ...string) map[string]map[string]any {
 	t.Helper()
-	s := &Server{Name: "conn3x", Version: "test", Tools: Tools("conn3x")}
+	s := &Server{Name: "conn3x", Version: "test", Tools: Tools(Options{Self: "conn3x", Root: "/"})}
 	var out bytes.Buffer
 	if err := s.Serve(context.Background(), strings.NewReader(strings.Join(lines, "\n")+"\n"), &out); err != nil {
 		t.Fatal(err)
@@ -84,7 +84,12 @@ func TestProtocol(t *testing.T) {
 
 func call(t *testing.T, tool string, args any) (map[string]any, bool) {
 	t.Helper()
-	for _, tl := range Tools("conn3x") {
+	return callWith(t, Options{Self: "conn3x", Root: "/"}, tool, args)
+}
+
+func callWith(t *testing.T, o Options, tool string, args any) (map[string]any, bool) {
+	t.Helper()
+	for _, tl := range Tools(o) {
 		if tl.Name != tool {
 			continue
 		}
@@ -162,8 +167,94 @@ func TestLintTool(t *testing.T) {
 	if isErr || res["failed"] != true || !strings.Contains(mustJSON(res), `"rule":"C3X003"`) {
 		t.Errorf("lint = %v", res)
 	}
-	if res, isErr := call(t, "lint", map[string]string{"dir": filepath.Join(dir, "nope")}); !isErr || !strings.Contains(res["error"].(string), "isn't a directory") {
+	if res, isErr := call(t, "lint", map[string]string{"dir": filepath.Join(dir, "nope")}); !isErr || !strings.Contains(res["error"].(string), "can't read") {
 		t.Errorf("a missing directory = %v", res)
+	}
+}
+
+// The tools that read a directory stay inside the one conn3x mcp was
+// started in, and the two that run conn3x there refuse provider plugins.
+func TestToolsStayInsideTheStartDirectory(t *testing.T) {
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, outside := filepath.Join(base, "root"), filepath.Join(base, "outside")
+	for _, d := range []string{filepath.Join(root, "circuit"), outside} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "link")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outside, "plan.bin"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Self is a name that can't run: a tool that gets as far as running
+	// conn3x fails with another error than the ones looked for here.
+	o := Options{Self: filepath.Join(base, "no-such-conn3x"), Root: root}
+	for _, tool := range []string{"validate", "lint"} {
+		for _, dir := range []string{outside, "../outside", "link", "circuit/../../outside", "/"} {
+			if res, isErr := callWith(t, o, tool, map[string]string{"dir": dir}); !isErr || !strings.Contains(res["error"].(string), "outside") {
+				t.Errorf("%s of %s = %v, want it refused as outside the start directory", tool, dir, res)
+			}
+		}
+	}
+	for _, args := range []map[string]string{
+		{"plan_file": filepath.Join(outside, "plan.bin")},
+		{"plan_file": "link/plan.bin"},
+		{"plan_file": "circuit/plan.bin", "dir": outside},
+	} {
+		if err := os.WriteFile(filepath.Join(root, "circuit", "plan.bin"), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if res, isErr := callWith(t, o, "summarise_plan", args); !isErr || !strings.Contains(res["error"].(string), "outside") {
+			t.Errorf("summarise_plan %v = %v, want it refused as outside the start directory", args, res)
+		}
+	}
+	if res, isErr := callWith(t, o, "lint", map[string]string{"dir": "circuit"}); isErr {
+		t.Errorf("lint inside the start directory = %v", res)
+	}
+
+	locked, cached := filepath.Join(root, "locked"), filepath.Join(root, "cached")
+	if err := os.MkdirAll(filepath.Join(cached, ".terraform", "providers", "registry.opentofu.org"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(locked, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(locked, ".terraform.lock.hcl"), []byte("provider \"registry.opentofu.org/x/marker\" {\n  version = \"1.0.0\"\n}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, dir := range []string{locked, cached} {
+		for tool, args := range map[string]map[string]string{"validate": {"dir": dir}, "summarise_plan": {"plan_file": "circuit/plan.bin", "dir": dir}} {
+			res, isErr := callWith(t, o, tool, args)
+			if !isErr || !strings.Contains(res["error"].(string), "-allow-plugins") {
+				t.Errorf("%s in %s = %v, want it refused for its provider plugins", tool, dir, res)
+			}
+		}
+		if err := noPlugins(Options{Root: root, AllowPlugins: true}, dir); err != nil {
+			t.Errorf("with -allow-plugins, %s is refused: %v", dir, err)
+		}
+	}
+	if err := noPlugins(o, filepath.Join(root, "circuit")); err != nil {
+		t.Errorf("a directory with no plugins is refused: %v", err)
+	}
+}
+
+func TestSearchCircuitsRefusesAnOversizedCatalogue(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"format_version":"1","circuits":[{"name":"`))
+		_, _ = w.Write(bytes.Repeat([]byte("a"), maxCatalogue))
+		_, _ = w.Write([]byte(`"}]}`))
+	}))
+	defer srv.Close()
+	saved := CatalogueURL
+	defer func() { CatalogueURL = saved }()
+	CatalogueURL = srv.URL
+	if res, isErr := call(t, "search_circuits", map[string]string{}); !isErr || !strings.Contains(res["error"].(string), "MiB") {
+		t.Errorf("an oversized catalogue = %.200v", res)
 	}
 }
 

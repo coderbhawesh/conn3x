@@ -32,6 +32,10 @@ func ReadInventory(path string) (*Inventory, error) {
 	if err != nil {
 		return nil, err
 	}
+	// An INI file doesn't go through parse, so the NUL check is repeated here.
+	if strings.Contains(string(src), "\x00") {
+		return nil, fmt.Errorf("%s has a NUL byte, which the converter doesn't accept anywhere in a file it reads", path)
+	}
 	inv := &Inventory{hostVars: map[string]map[string]string{}, groups: map[string]*groupDef{}}
 	if strings.HasSuffix(path, ".yml") || strings.HasSuffix(path, ".yaml") {
 		err = inv.readYAML(src)
@@ -41,7 +45,27 @@ func ReadInventory(path string) (*Inventory, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
+	// depth follows children up to their parents, so a loop would never end.
+	for name := range inv.groups {
+		if inv.descends(name, name, map[string]bool{}) {
+			return nil, fmt.Errorf("%s: group %q is a child of itself", path, name)
+		}
+	}
 	return inv, nil
+}
+
+// descends reports whether target is below name in the group tree.
+func (inv *Inventory) descends(name, target string, seen map[string]bool) bool {
+	if seen[name] {
+		return false
+	}
+	seen[name] = true
+	for _, c := range inv.groups[name].children {
+		if c == target || (inv.groups[c] != nil && inv.descends(c, target, seen)) {
+			return true
+		}
+	}
+	return false
 }
 
 func (inv *Inventory) group(name string) *groupDef {
@@ -115,7 +139,7 @@ func unquote(s string) string { return strings.Trim(s, `"'`) }
 
 func (inv *Inventory) readYAML(src []byte) error {
 	var doc yaml.Node
-	if err := yaml.Unmarshal(src, &doc); err != nil {
+	if err := parse(src, &doc); err != nil {
 		return err
 	}
 	if len(doc.Content) == 0 {

@@ -79,6 +79,11 @@ func Locate(ctx context.Context, r modules.Runner, user string) (Location, error
 	return Location{Dir: dir, File: dir + "/authorized_keys", Owner: user, Group: u.Group}, nil
 }
 
+// MaxRead is the largest authorized_keys or known_hosts file Read returns.
+// The user owns the file, and one that's huge or sparse would otherwise
+// fill the controller's memory.
+var MaxRead = 1 << 20
+
 // Read returns the current authorized_keys content, read as the user so a
 // symlink in their ~/.ssh can't make a privileged read return a file they
 // couldn't read themselves. A missing file reads as empty; a file that
@@ -87,13 +92,16 @@ func Locate(ctx context.Context, r modules.Runner, user string) (Location, error
 func Read(ctx context.Context, r modules.Runner, loc Location) (string, error) {
 	script := fmt.Sprintf(`f=%s
 [ -e "$f" ] || exit 0
-cat -- "$f"`, ssh.Quote(loc.File))
+head -c %d < "$f"`, ssh.Quote(loc.File), MaxRead+1)
 	res, err := r.Run(ctx, modules.AsUser(loc.Owner, script), nil)
 	if err != nil {
 		return "", err
 	}
 	if res.ExitCode != 0 {
 		return "", fmt.Errorf("reading %s as %s: %s", loc.File, loc.Owner, strings.TrimSpace(string(res.Stderr)))
+	}
+	if len(res.Stdout) > MaxRead {
+		return "", fmt.Errorf("%s is over %d MiB, the most Conn3x reads of it", loc.File, MaxRead>>20)
 	}
 	return string(res.Stdout), nil
 }

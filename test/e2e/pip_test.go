@@ -143,7 +143,7 @@ func TestPipWontRunAnotherUsersCodeAsRoot(t *testing.T) {
 			w3 := newWorkdir(t, "pip_guard")
 			w3.writeAs("main.circuit.hcl", pipGuardVars{h.port, h.keyFile, h.knownHosts, "/opt/open/venv", ""})
 			w3.mustConn3x("init", "-no-color")
-			if out, code := w3.conn3x("apply", "-auto-approve", "-no-color"); code == 0 || !strings.Contains(out, "written by other users") {
+			if out, code := w3.conn3x("apply", "-auto-approve", "-no-color"); code == 0 || !strings.Contains(strings.Join(strings.Fields(out), " "), "/opt/open can be written by anyone") {
 				t.Fatalf("apply under a 0777 directory exited %d:\n%s", code, out)
 			}
 

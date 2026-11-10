@@ -121,8 +121,13 @@ func normalize(name string) string {
 // or to this user, and be safe from everyone else writing to it. That's what
 // stops a run as root trusting a venv in someone's home. -I keeps python from
 // importing out of the working directory or following PYTHON* variables.
+//
+// Those checks look at where the venv really is. The path as written is
+// walked first, for a run as root: a link on it that someone else owns could
+// point at root's own venv, which would pass them all. And a venv that isn't
+// there yet, in a directory anyone can create in, is made here or not used.
 func (d Desired) script(body string) string {
-	s := fmt.Sprintf(`set -e
+	s := "route_strict=1\n" + modules.Settled + fmt.Sprintf(`set -e
 cd /
 HOME=$(getent passwd "$(id -u)" | cut -d: -f6); export HOME
 me=$(id -u)
@@ -150,18 +155,22 @@ if [ -e "$real" ]; then
     echo "$bad could have been changed by another user, so it won't be run; set user to the venv's owner, or rebuild the venv" >&2; exit 3
   fi
 fi
-usable() { [ -x "$py" ] && "$py" -I -m pip --version >/dev/null 2>&1; }
+usable() { route_settled "$real" && [ -x "$py" ] && "$py" -I -m pip --version >/dev/null 2>&1; }
 %s`, ssh.Quote(d.Venv), body)
 	if d.User != "" {
 		return modules.AsUser(d.User, s)
 	}
-	return s
+	return modules.GuardRoot(s, modules.Whole(d.Venv))
 }
 
 func (d Desired) run(ctx context.Context, r modules.Runner, body string) (string, error) {
 	res, err := r.Run(ctx, d.script(body), nil)
 	if err != nil {
 		return "", err
+	}
+	if res.ExitCode == 125 && d.User == "" {
+		// The walk's refusal: it names the path, and this says what to do.
+		return "", fmt.Errorf("%s, since it runs what the venv holds; set user to the venv's owner, or move the venv", strings.TrimSpace(string(res.Stderr)))
 	}
 	if res.ExitCode != 0 {
 		return "", fmt.Errorf("%s", strings.TrimSpace(string(res.Stderr)))
@@ -242,7 +251,7 @@ func Apply(ctx context.Context, r modules.Runner, d Desired) error {
 		if d.State == Latest {
 			upgrade = "--upgrade "
 		}
-		body = fmt.Sprintf(`usable || python3 -I -m venv "$real"
+		body = fmt.Sprintf(`usable || { route_mkdir "$real"; python3 -I -m venv "$real"; }
 "$py" -I -m pip install %s --quiet %s%s`, pipFlags, upgrade, ssh.Quote(spec))
 	}
 	_, err := d.run(ctx, r, body)

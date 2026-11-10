@@ -40,6 +40,8 @@ step "node_exporter" {
 
 **Downloading.** Conn3x creates the parent directories of `dest`, then downloads to a temporary file beside it with `curl`, or with `wget` when `curl` isn't installed. If the checksum doesn't match, the apply fails and the temporary file is removed, so `dest` is never a partial or unverified file. Otherwise Conn3x sets the mode and ownership, flushes the file to disk, and renames it over `dest`. On SELinux hosts the file is relabelled for its path with `restorecon`.
 
+**Logging in.** `url` can't hold a user name or password: it's in the plan, the state, the errors and the host's process list. For a server that needs a login, put a netrc file on the host with a [`file`](/modules/file) step, using `content_wo` and mode `"0600"`, and name it in `netrc_file`. That needs `curl` on the host. Changing `netrc_file` alone doesn't plan a new download.
+
 **Mode.** The default mode is `"0644"`. `owner` and `group` are set only when you give them.
 
 **Requirements.** The host needs `curl` or `wget`. If it has neither, add a [`package`](/modules/package) step for one before this step.

@@ -39,4 +39,4 @@ Deleting a `wait_for` step does nothing on the host.
 
 ## From Ansible
 
-`conn3x convert ansible` turns `wait_for` tasks on the host itself into `wait_for` steps, carrying over `path` and `port`, and turning `timeout` in seconds into a duration such as `"300s"`. `delay` is dropped. A task that waits for another host, or for a state other than `started` or `present`, stays a TODO.
+`conn3x convert ansible` turns `wait_for` tasks on the host itself into `wait_for` steps, carrying over `path` and `port`, and turning `timeout` in seconds into a duration such as `"300s"`. `delay` is dropped. A task that waits for another host, or for a state other than `started` or `present`, stays a TODO, as does a `port` that isn't a whole number.

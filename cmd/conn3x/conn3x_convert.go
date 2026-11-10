@@ -4,12 +4,14 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"unicode"
 
 	"github.com/opentofu/opentofu/internal/command"
 	"github.com/opentofu/opentofu/internal/conn3x/convert/ansible"
@@ -25,7 +27,7 @@ func convertCommand() command.Command {
 
 Write the result beside the playbook so the files it copies resolve. With -i, hosts and logins come from the inventory.
 
-With -out, each role a play runs, from its roles list or an include_role or import_role in its task lists, is converted from roles/ beside the playbook into a circuit directory beside the output file, and called as a module in the order Ansible runs it. A directory that already has files is kept as it is.
+With -out, each role a play runs, from its roles list or an include_role or import_role in its task lists, is converted from roles/ beside the playbook into a circuit directory beside the output file, and called as a module in the order Ansible runs it. A directory that already has files is kept as it is, with a TODO(convert) line in the output file to say this run didn't write it.
 
 With -role, converts one role's directory instead, such as one ansible-galaxy installed, into a new circuit directory named by -out. Nothing is downloaded: install a role from Galaxy yourself, with ansible-galaxy, then point -role at it.
 
@@ -77,9 +79,16 @@ func runConvert(playbook, inventory, out string, stdout, stderr io.Writer) int {
 	if out == "" {
 		_, err = stdout.Write(res.HCL)
 	} else {
-		err = writeRoles(res.Files, filepath.Dir(out), stderr)
+		var kept []string
+		kept, err = writeRoles(res.Files, filepath.Dir(out), stderr)
+		// Said in the file too: a module block there calls a directory this
+		// run didn't write, and the line on stderr is soon gone.
+		var note bytes.Buffer
+		for _, top := range kept {
+			fmt.Fprintf(&note, "# TODO(convert): %s already had files, so this run didn't write it. Check it's the circuit you expect before you apply.\n", top)
+		}
 		if err == nil {
-			err = os.WriteFile(out, res.HCL, 0o644)
+			err = writeNew(out, append(note.Bytes(), res.HCL...))
 		}
 	}
 	if err != nil {
@@ -89,22 +98,51 @@ func runConvert(playbook, inventory, out string, stdout, stderr io.Writer) int {
 	return report(res, stderr, len(res.Files) > 0)
 }
 
+// writeNew writes path by renaming a new file over it, so a link already at
+// path is replaced rather than written through.
+func writeNew(path string, b []byte) error {
+	f, err := os.CreateTemp(filepath.Dir(path), ".conn3x-convert-*")
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(b)
+	if err == nil {
+		err = f.Chmod(0o644)
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Rename(f.Name(), path)
+	}
+	if err != nil {
+		os.Remove(f.Name())
+	}
+	return err
+}
+
 // writeRoles writes the circuit directory of each role a playbook runs.
-// One that already has files is kept as it is, since it may hold edits.
-func writeRoles(files map[string][]byte, dir string, stderr io.Writer) error {
+// One that already has files is kept as it is, since it may hold edits, and
+// returned so the caller can say so.
+func writeRoles(files map[string][]byte, dir string, stderr io.Writer) ([]string, error) {
 	paths := make([]string, 0, len(files))
 	for p := range files {
 		paths = append(paths, p)
 	}
 	sort.Strings(paths)
 	kept := map[string]bool{}
+	var keptDirs []string
 	for _, p := range paths {
 		top, _, _ := strings.Cut(p, "/")
 		if _, done := kept[top]; !done {
+			if st, err := os.Lstat(filepath.Join(dir, top)); err == nil && st.Mode()&os.ModeSymlink != 0 {
+				return nil, fmt.Errorf("%s is a link; a role's circuit is written to a directory of its own, so remove the link or convert somewhere else", filepath.Join(dir, top))
+			}
 			entries, err := os.ReadDir(filepath.Join(dir, top))
 			kept[top] = err == nil && len(entries) > 0
 			if kept[top] {
-				fmt.Fprintf(stderr, "Kept %s, which already has files; convert into a new directory to see the role's circuit as it converts now.\n", top)
+				keptDirs = append(keptDirs, top)
+				fmt.Fprintf(stderr, "Kept %s, which already has files, so this run didn't write it: check it's the circuit you expect. Convert into a new directory to see the role's circuit as it converts now.\n", top)
 			}
 		}
 		if kept[top] {
@@ -112,13 +150,13 @@ func writeRoles(files map[string][]byte, dir string, stderr io.Writer) error {
 		}
 		path := filepath.Join(dir, filepath.FromSlash(p))
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-			return err
+			return nil, err
 		}
 		if err := os.WriteFile(path, files[p], 0o644); err != nil {
-			return err
+			return nil, err
 		}
 	}
-	return nil
+	return keptDirs, nil
 }
 
 // runConvertRole converts a role into a new circuit directory. It never
@@ -188,9 +226,25 @@ func report(res ansible.Result, stderr io.Writer, files bool) int {
 	return code
 }
 
+// printable shows control and formatting characters as escapes. Task names,
+// reasons and file names quote the playbook, which could otherwise move the
+// cursor or repaint the summary.
+func printable(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || r == unicode.ReplacementChar {
+			fmt.Fprintf(&b, `\u%04x`, r)
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
 func listIssues(stderr io.Writer, issues []ansible.Issue, files bool) {
 	for _, r := range issues {
-		name := r.Task
+		name := printable(r.Task)
+		r.File, r.Reason = printable(r.File), printable(r.Reason)
 		if name == "" {
 			name = "(unnamed task)"
 		}

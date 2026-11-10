@@ -50,7 +50,9 @@ step "readable_by_the_app" {
 <!-- reference -->
 ## How it works
 
-**Writing.** Conn3x makes a temp file beside the target with its access rules already on it, writes the content, then renames it over the target in one step. A target that's already there with looser rules can't expose a new secret.
+**Writing.** Conn3x makes a temp file beside the target with its access rules already on it, writes the content, then renames it over the target in one step. It does all of that, and a delete, through open handles: each folder is opened from the one above it, and the file from its folder, so no name is looked up a second time. A target that's already there with looser rules can't expose a new secret.
+
+**What state keeps.** `content_hmac` is a keyed HMAC over the path and the content's hash, which is what lets a refresh compare it with the hash the host reports. Unlike a `password_hmac` it isn't stretched or tied to the host, so keep the HMAC key away from the state: someone holding both could test guesses at a short secret.
 
 **Links.** It never writes through a symbolic link, a junction or a mount point, at the path or on the way to it, and it refuses a file with other hard links. Use the real path.
 

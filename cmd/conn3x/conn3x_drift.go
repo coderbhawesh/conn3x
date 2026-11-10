@@ -4,8 +4,8 @@
 package main
 
 import (
-	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -17,6 +17,8 @@ import (
 	"github.com/opentofu/opentofu/internal/command"
 	"github.com/opentofu/opentofu/internal/command/arguments"
 	"github.com/opentofu/opentofu/internal/conn3x/provider"
+	runreport "github.com/opentofu/opentofu/internal/conn3x/report"
+	"github.com/opentofu/opentofu/internal/conn3x/termsafe"
 )
 
 // driftCommand reports what changed outside Conn3x since the last apply,
@@ -110,6 +112,10 @@ func runPlan(plan *exec.Cmd, errOut io.Writer) (driftReport, int, error) {
 			code = exit.ExitCode()
 		}
 	}
+	var long runreport.LongLines
+	if errors.As(readErr, &long) {
+		return r, 1, fmt.Errorf("%w. One of them could have been a drifted resource or an error, so drift can't say what changed; a very large output value or error message is the usual cause", readErr)
+	}
 	if readErr != nil {
 		return r, 1, fmt.Errorf("reading the plan: %w", readErr)
 	}
@@ -201,9 +207,7 @@ func (r driftReport) confirmed(planned []string, planCode int) (driftReport, int
 // readDrift collects the drifted resources and errors from plan -json.
 func readDrift(r io.Reader) (driftReport, error) {
 	var rep driftReport
-	sc := bufio.NewScanner(r)
-	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
-	for sc.Scan() {
+	err := runreport.EachLine(r, func(line []byte) {
 		var msg struct {
 			Type   string `json:"type"`
 			Change struct {
@@ -217,8 +221,8 @@ func readDrift(r io.Reader) (driftReport, error) {
 				Severity, Summary, Detail string
 			} `json:"diagnostic"`
 		}
-		if json.Unmarshal(sc.Bytes(), &msg) != nil {
-			continue
+		if json.Unmarshal(line, &msg) != nil {
+			return
 		}
 		switch msg.Type {
 		case "resource_drift":
@@ -252,11 +256,18 @@ func readDrift(r io.Reader) (driftReport, error) {
 				}
 			}
 		}
-	}
-	return rep, sc.Err()
+	})
+	// A line that was passed over could have been a drifted resource or an
+	// error, so the result can't be trusted.
+	return rep, err
 }
 
-func (r driftReport) write(w io.Writer) {
+// write prints the report. The addresses and errors in it carry text from
+// hosts and circuits, so control characters are written out as escapes.
+func (r driftReport) write(out io.Writer) {
+	var b strings.Builder
+	defer func() { _, _ = io.WriteString(out, termsafe.Escape(b.String())) }()
+	w := &b
 	n := len(r.cloud) + len(r.hosts)
 	switch {
 	case r.outputsOnly:

@@ -30,7 +30,7 @@ step "web_assets" {
 
 **Reading.** Every plan checks whether `creates` exists on the host. The step is in sync while it does. Conn3x doesn't compare the unpacked files with the archive.
 
-**Applying.** Conn3x creates `dest` if it's missing and unpacks into it, overwriting files that are already there. Files ending in `.zip` are unpacked with `unzip`. Anything else is unpacked with `tar`, which detects the compression itself. If `creates` still doesn't exist afterwards, the apply fails. Changing `src` or `creates` unpacks the archive again on the next apply.
+**Applying.** Conn3x creates `dest` if it's missing and unpacks into it, overwriting files that are already there. Whoever owns `dest` does the unpacking. In a directory another user owns, a step working as root runs as that user, who has to be able to read `src`, and the files belong to them. A `dest` that anyone can write to, such as `/tmp` itself, is refused: unpack into a directory below it. Files ending in `.zip` are unpacked with `unzip`. Anything else is unpacked with `tar`, which detects the compression itself. If `creates` still doesn't exist afterwards, the apply fails. Changing `src` or `creates` unpacks the archive again on the next apply.
 
 **Requirements.** `src` must already be on the host, for example from a `download` step earlier in the circuit. Zip files need `unzip` installed. If it's missing, add a [`package`](/modules/package) step for it first.
 

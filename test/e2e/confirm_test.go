@@ -6,6 +6,7 @@
 package e2e
 
 import (
+	"os/exec"
 	"strings"
 	"testing"
 )
@@ -54,5 +55,39 @@ func TestConfirmAfterRevertsALockout(t *testing.T) {
 	}
 	if out := w.mustConn3x("plan", "-no-color"); !strings.Contains(out, "No changes.") {
 		t.Fatalf("plan after the confirmed apply:\n%s", out)
+	}
+}
+
+// confirm_after copies the file and puts it back as root, by name. In a
+// directory of alice's she chooses what is copied, can stop the write, and
+// can point the name somewhere else before the revert, so the step refuses.
+func TestConfirmAfterRefusesAUsersDirectory(t *testing.T) {
+	h, guard := routeHost(t, "rocky10")
+	// Once the write runs as her, alice holds it, swaps the directory for a
+	// link to one she can't reach, and kills it so that the revert follows.
+	h.exec(`while :; do
+  for p in /proc/[0-9]*; do
+    [ -O "$p" ] && grep -qa '\.conn3x\.XXXXXX' "$p/cmdline" 2>/dev/null || continue
+    kill -STOP "${p#/proc/}"
+    mv /home/alice/d /home/alice/d.old && ln -s /opt/guard /home/alice/d
+    kill -KILL "${p#/proc/}"
+    exit 0
+  done
+done
+`, "su", "alice", "-c", "mkdir /home/alice/d && echo hers > /home/alice/d/f && cat > /home/alice/swap.sh")
+	if err := exec.Command("podman", "exec", "-d", "--user", "alice", h.container, "sh", "/home/alice/swap.sh").Run(); err != nil {
+		t.Fatal(err)
+	}
+	want := guard()
+	_, out, code := routeApply(t, h, `file {
+      path          = "/home/alice/d/f"
+      content       = "managed\n"
+      confirm_after = "20s"
+    }`)
+	if got := guard(); got != want {
+		t.Fatalf("the revert wrote where alice can't:\n%s\napply said:\n%s", got, out)
+	}
+	if code == 0 || !strings.Contains(out, "confirm_after puts a file back as root") {
+		t.Fatalf("confirm_after in alice's directory, exit %d:\n%s", code, out)
 	}
 }

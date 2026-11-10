@@ -248,7 +248,7 @@ func (c *converter) otherVarFiles() map[string][]string {
 		}
 		src, err := os.ReadFile(m)
 		var doc yaml.Node
-		if err != nil || yaml.Unmarshal(src, &doc) != nil || len(doc.Content) == 0 {
+		if err != nil || parse(src, &doc) != nil || len(doc.Content) == 0 {
 			continue
 		}
 		for _, kv := range pairs(doc.Content[0]) {
@@ -296,7 +296,7 @@ func (c *converter) main(body *hclwrite.Body, sub string) (*yaml.Node, string) {
 		src, err := os.ReadFile(c.path(rel))
 		var doc yaml.Node
 		if err == nil {
-			err = yaml.Unmarshal(src, &doc)
+			err = parse(src, &doc)
 		}
 		if err != nil {
 			c.note(body, sub, rel, 0, "can't be read: "+err.Error())

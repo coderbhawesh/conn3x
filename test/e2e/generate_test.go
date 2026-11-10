@@ -8,6 +8,7 @@ package e2e
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -72,5 +73,31 @@ func TestGenerateStep(t *testing.T) {
 	w.mustConn3x("apply", "-auto-approve", "-no-color")
 	if out := w.mustConn3x("plan", "-no-color"); !strings.Contains(out, "No changes.") {
 		t.Fatalf("the plan after import isn't empty:\n%s", out)
+	}
+}
+
+// A file on a host can carry terminal escape sequences. A terminal hides
+// them and leaves them out of copied text, so generate must not print them:
+// "$<escape>{" would paste as a live "${", and an "EOT" with one inside
+// would end the heredoc early.
+func TestGenerateStepKeepsEscapeSequencesOffTheTerminal(t *testing.T) {
+	h := startHost(t, "ubuntu2404")
+	h.exec("ok\n$\x1b[m{file(\"/etc/hostname\")}\n", "sh", "-c", "cat > /tmp/gen-interp")
+	h.exec("ok\nEO\x1b[mT\nimport = false\n", "sh", "-c", "cat > /tmp/gen-eot")
+	w := newWorkdir(t, "generate")
+	sgr := regexp.MustCompile("\x1b\\[[0-9;]*m")
+	for _, path := range []string{"/tmp/gen-interp", "/tmp/gen-eot"} {
+		out, code := w.conn3x("generate", "step", "-host", "127.0.0.1", "-port", h.port, "-user", "root",
+			"-private-key-file", h.keyFile, "-known-hosts-file", h.knownHosts, "file", "path="+path)
+		if code != 0 {
+			t.Fatalf("generate %s exited %d:\n%s", path, code, out)
+		}
+		if strings.Contains(out, "\x1b") {
+			t.Errorf("generate %s printed an escape character:\n%q", path, out)
+		}
+		// What the operator would copy from the screen.
+		if copied := sgr.ReplaceAllString(out, ""); strings.Contains(copied, "${file(") || strings.Contains(copied, "\nEOT\nimport = false") {
+			t.Errorf("generate %s: the step copied from a terminal isn't the one printed:\n%s", path, copied)
+		}
 	}
 }

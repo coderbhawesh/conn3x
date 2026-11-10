@@ -88,15 +88,32 @@ func Arm(ctx context.Context, r modules.Runner, g Guard) error {
 	}
 	q := ssh.Quote
 	var b strings.Builder
-	fmt.Fprintf(&b, "set -e\numask 077\nmkdir -p -m 0700 %s\nchmod 0700 %s\nrm -rf -- %s\nmkdir -m 0700 %s\n", q(Dir), q(Dir), q(g.dir()), q(g.dir()))
+	b.WriteString("set -e\numask 077\n")
+	// The copy and the revert are root's, by name, and the revert comes
+	// later. So a file is only guarded where nobody but root can change what
+	// its name leads to, then or now: not in a directory that is someone
+	// else's, nor in one anyone can create in.
+	var routes []modules.Route
+	for _, f := range g.Files {
+		routes = append(routes, modules.Parent(f))
+		fmt.Fprintf(&b, "[ ! -k \"$(dirname -- %[1]s)\" ] || { printf 'refusing %%s: anyone can create files in its directory\\n' %[1]s >&2; exit 125; }\n", q(f))
+	}
+	fmt.Fprintf(&b, "mkdir -p -m 0700 %s\nchmod 0700 %s\nrm -rf -- %s\nmkdir -m 0700 %s\n", q(Dir), q(Dir), q(g.dir()), q(g.dir()))
 	for i, f := range g.Files {
 		fmt.Fprintf(&b, "if [ -e %s ]; then cp -a -- %s %s/%d; else : > %s/%d.absent; fi\n", q(f), q(f), q(g.dir()), i, q(g.dir()), i)
 	}
 	fmt.Fprintf(&b, "cat > %s/revert.sh\n", q(g.dir()))
 	secs := int(g.After.Round(time.Second) / time.Second)
 	fmt.Fprintf(&b, "systemd-run --quiet --collect --unit=%s --on-active=%ds --timer-property=AccuracySec=1s /bin/sh %s/revert.sh\n", q(g.unit()), secs, q(g.dir()))
-	if _, err := run(ctx, r, b.String(), []byte(g.Script())); err != nil {
+	res, err := r.Run(ctx, modules.GuardRoot(b.String(), routes...), []byte(g.Script()))
+	if err != nil {
 		return fmt.Errorf("scheduling the revert: %w", err)
+	}
+	if res.ExitCode == 125 {
+		return fmt.Errorf("confirm_after puts a file back as root, so it only guards one that nobody but root can lead somewhere else: %s", strings.TrimSpace(string(res.Stderr)))
+	}
+	if res.ExitCode != 0 {
+		return fmt.Errorf("scheduling the revert: exit status %d: %s", res.ExitCode, strings.TrimSpace(string(res.Stderr)))
 	}
 	return nil
 }

@@ -5,10 +5,16 @@ package fetch
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/opentofu/opentofu/internal/conn3x/modules/file"
+	"github.com/opentofu/opentofu/internal/conn3x/modules/moduletest"
 	"github.com/opentofu/opentofu/internal/conn3x/transport/ssh"
 )
 
@@ -25,6 +31,9 @@ func TestDownloadValidate(t *testing.T) {
 		{URL: "https://example.com/a", Dest: "/opt/a", SHA256: ""},
 		{URL: "https://example.com/a", Dest: "/opt/a", SHA256: strings.ToUpper(sum)[:63]},
 		{URL: "https://example.com/a", Dest: "/opt/a", SHA256: sum, Mode: "rwx"},
+		{URL: "https://user:secret@example.com/a", Dest: "/opt/a", SHA256: sum},
+		{URL: "https://token@example.com/a", Dest: "/opt/a", SHA256: sum},
+		{URL: "https://example.com/a", Dest: "/opt/a", SHA256: sum, NetrcFile: "netrc"},
 	} {
 		if bad.Validate() == nil {
 			t.Errorf("accepted %+v", bad)
@@ -52,6 +61,7 @@ func TestGitValidate(t *testing.T) {
 		{Repo: "https://github.com/octocat/Hello-World.git", Dest: "/srv/app"},
 		{Repo: "git@github.com:octocat/Hello-World.git", Dest: "/srv/app", Ref: "v1.2.3"},
 		{Repo: "ssh://git@example.com/app.git", Dest: "/srv/app", Ref: "release/2026"},
+		{Repo: "http://example.com/app.git", Dest: "/srv/app", Ref: "0123456789abcdef0123456789abcdef01234567"},
 	} {
 		if err := ok.Validate(); err != nil {
 			t.Errorf("rejected %+v: %v", ok, err)
@@ -64,6 +74,9 @@ func TestGitValidate(t *testing.T) {
 		{Repo: "https://example.com/a.git", Dest: "srv"},
 		{Repo: "https://example.com/a.git", Dest: "/srv/app", Ref: "-x"},
 		{Repo: "https://example.com/a.git", Dest: "/srv/app", Ref: "main;reboot"},
+		{Repo: "http://example.com/a.git", Dest: "/srv/app"},
+		{Repo: "http://example.com/a.git", Dest: "/srv/app", Ref: "v1.2.3"},
+		{Repo: "https://token@example.com/a.git", Dest: "/srv/app"},
 	} {
 		if bad.Validate() == nil {
 			t.Errorf("accepted %+v", bad)
@@ -111,5 +124,39 @@ func TestDownloadSyncsBeforeAndAfterRename(t *testing.T) {
 	syncTmp, rename, syncDir := strings.Index(r.script, file.SyncFile), strings.Index(r.script, `mv -f -- "$tmp" "$p"`), strings.Index(r.script, file.SyncDir)
 	if syncTmp < 0 || rename < 0 || syncDir < 0 || syncTmp > rename || rename > syncDir {
 		t.Fatalf("want sync of the temp file, then the rename, then sync of the directory:\n%s", r.script)
+	}
+}
+
+// A download that needs a login takes it from a netrc file on the host, so
+// it is never in the URL or on curl's command line.
+func TestDownloadLogsInWithANetrcFile(t *testing.T) {
+	for _, tool := range []string{"curl", "sha256sum"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skip("needs " + tool)
+		}
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if u, p, ok := r.BasicAuth(); !ok || u != "deploy" || p != "s3cret" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_, _ = w.Write([]byte("test"))
+	}))
+	defer srv.Close()
+	dir := t.TempDir()
+	netrc := filepath.Join(dir, "netrc")
+	if err := os.WriteFile(netrc, []byte("machine 127.0.0.1 login deploy password s3cret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	d := Download{URL: srv.URL + "/a", Dest: filepath.Join(dir, "a"), SHA256: sum}
+	if err := ApplyDownload(context.Background(), moduletest.Local{}, d); err == nil {
+		t.Fatal("downloaded without a login")
+	}
+	d.NetrcFile = netrc
+	if err := ApplyDownload(context.Background(), moduletest.Local{}, d); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(d.Dest); string(got) != "test" {
+		t.Fatalf("dest holds %q", got)
 	}
 }

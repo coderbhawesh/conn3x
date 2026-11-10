@@ -1,0 +1,27 @@
+circuit "stopped" {
+  hosts = { leaf1 = "{{.Host}}" }
+
+  ssh {
+    port             = {{.Port}}
+    user             = "admin"
+    private_key_file = "{{.KeyFile}}"
+    known_hosts_file = "{{.KnownHosts}}"
+    confirm_after    = "5s"
+  }
+
+  step "vlan" {
+    eos_vlan {
+      vlan_id = 221
+      name    = "stopped"
+    }
+  }
+
+  # Fails before it reaches the switch, so nothing aborts the session the
+  # step above started.
+  step "nobody" {
+    eos_user {
+      name        = "c3xnobody"
+      password_wo = ""
+    }
+  }
+}

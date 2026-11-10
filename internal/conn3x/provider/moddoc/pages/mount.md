@@ -46,7 +46,7 @@ step "scratch" {
 
 **The fstab entry.** Conn3x writes `<src> <path> <fstype> <opts> 0 0`, replacing any existing entry for the same mount point, and leaves the rest of the file alone. Where systemd runs, Conn3x then runs `systemctl daemon-reload`, so systemd picks up the change.
 
-**Mounting.** Conn3x creates the mount point if it's missing, then mounts it. If the right file system is already mounted, it remounts it to apply new options. If a different file system is mounted there, Conn3x unmounts it and mounts the new one.
+**Mounting.** Conn3x creates the mount point if it's missing, then mounts it. Directly in a directory anyone can create in, such as `/tmp`, the mount point has to be one Conn3x creates or one root already owns. If the right file system is already mounted, it remounts it to apply new options. If a different file system is mounted there, Conn3x unmounts it and mounts the new one.
 
 **Rules.** `path` must be an absolute path other than `/`. `path`, `src`, `fstype` and `opts` can't contain spaces.
 

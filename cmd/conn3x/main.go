@@ -44,7 +44,7 @@ const (
 )
 
 func main() {
-	os.Exit(realMain())
+	os.Exit(finish(realMain())) // CONN3X: abort staged EOS sessions on a failed run
 }
 
 func realMain() int {

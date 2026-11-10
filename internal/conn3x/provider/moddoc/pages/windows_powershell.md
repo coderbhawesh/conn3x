@@ -31,9 +31,9 @@ step "long_paths" {
 
 **Failing.** A script fails by throwing. Errors stop it by default, because `$ErrorActionPreference` is `Stop`. It also fails when the last native program it ran exits non-zero; for a tool with other success codes, such as `robocopy`, finish with `$global:LASTEXITCODE = 0`. Calling `exit` is reported as a failure: use `return` to finish early, and `throw` to fail.
 
-**Guards.** Like `command`, the script runs when the step is created, when anything that defines it changes, and when a refresh finds its guards no longer hold. `unless` runs at every plan, so it must change nothing.
+**Guards.** Like `command`, the script runs when the step is created, when anything that defines it changes, and when a refresh finds its guards no longer hold. `unless` runs at every plan, with the same rights as the script, so it must change nothing. A circuit someone else wrote can act on your hosts at `plan` this way: read its `unless` checks as you would its scripts.
 
-**Secrets.** `args_wo` stays out of the plan and state. State records only `args_hmac`, and the values are blanked from output and errors. A refresh doesn't have them, so an `unless` check that needs them sees them only during an apply.
+**Secrets.** `args_wo` stays out of the plan and state. State records only `args_hmac`, and the values are blanked from output and errors. A refresh doesn't have them, so an `unless` check that needs them sees them only during an apply. `args_hmac` is a plain keyed HMAC, not stretched the way a `password_hmac` is, so keep the HMAC key away from the state when a value is short enough to guess.
 
 **Secrets and logging.** Where a policy turns on PowerShell's module logging, Windows records what's passed to any cmdlet. Conn3x keeps `args_wo` away from cmdlets on its way to your script, so don't pass a secret to one yourself: use a .NET method, as in `[IO.File]::WriteAllText($A.path, $A.secret)`.
 

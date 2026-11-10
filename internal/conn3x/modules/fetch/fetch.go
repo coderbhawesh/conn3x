@@ -36,6 +36,20 @@ func httpURL(u string) error {
 	if !strings.HasPrefix(u, "https://") && !strings.HasPrefix(u, "http://") || strings.ContainsAny(u, " \t\r\n") {
 		return fmt.Errorf("url %q must be an http or https URL without spaces", u)
 	}
+	return noUserinfo("url", u)
+}
+
+// noUserinfo refuses a user name or password in an http or https URL. The
+// URL is in the plan, the state, the host's process list and the errors.
+func noUserinfo(label, u string) error {
+	_, rest, ok := strings.Cut(u, "://")
+	if !ok || !strings.HasPrefix(u, "http") {
+		return nil
+	}
+	authority, _, _ := strings.Cut(rest, "/")
+	if strings.Contains(authority, "@") {
+		return fmt.Errorf("%s must not hold a user name or password, which would show in the plan, the state and the host's process list; put them in a netrc file on the host instead", label)
+	}
 	return nil
 }
 
@@ -43,6 +57,9 @@ func httpURL(u string) error {
 type Download struct {
 	URL, Dest, SHA256  string
 	Mode, Owner, Group string // mode defaults to 0644
+	// NetrcFile is a netrc file on the host with the login for the URL's
+	// server, for a download that needs one.
+	NetrcFile string
 }
 
 // Validate checks a Download before anything reaches the host.
@@ -59,12 +76,15 @@ func (d Download) Validate() error {
 	if d.Mode != "" && !modeOctal.MatchString(d.Mode) {
 		return fmt.Errorf("mode %q must be four octal digits, like \"0644\"", d.Mode)
 	}
+	if d.NetrcFile != "" {
+		return absolute("netrc_file", d.NetrcFile)
+	}
 	return nil
 }
 
 // ReadDownload returns the SHA-256 of the file at dest, or "" if it is missing.
 func ReadDownload(ctx context.Context, r modules.Runner, dest string) (string, error) {
-	res, err := r.Run(ctx, modules.Guard(fmt.Sprintf("if [ -f %[1]s ]; then sha256sum -- %[1]s; fi", ssh.Quote(dest)), modules.Follow(dest)), nil)
+	res, err := r.Run(ctx, modules.Guard(modules.Settled+fmt.Sprintf("if route_settled %[1]s && [ -f %[1]s ]; then sha256sum -- %[1]s; fi", ssh.Quote(dest)), modules.Follow(dest)), nil)
 	if err := check(res, err); err != nil {
 		return "", err
 	}
@@ -83,6 +103,14 @@ func ApplyDownload(ctx context.Context, r modules.Runner, d Download) error {
 	if mode == "" {
 		mode = "0644"
 	}
+	// -q and --no-config keep curl and wget from reading the settings of
+	// whoever the script runs as. BusyBox wget has neither option nor file.
+	routes := []modules.Route{modules.Parent(d.Dest)}
+	netrc := ""
+	if d.NetrcFile != "" {
+		netrc = " --netrc-file " + ssh.Quote(d.NetrcFile)
+		routes = append(routes, modules.Follow(d.NetrcFile))
+	}
 	script := fmt.Sprintf(`set -e
 p=%[1]s
 url=%[2]s
@@ -90,8 +118,11 @@ want=%[3]s
 mkdir -p -- "$(dirname -- "$p")"
 tmp=$(mktemp "$(dirname -- "$p")/.conn3x.XXXXXX")
 trap 'rm -f -- "$tmp"' EXIT
-if command -v curl >/dev/null 2>&1; then curl -fsSL --retry 3 -o "$tmp" -- "$url"
-elif command -v wget >/dev/null 2>&1; then wget -q -O "$tmp" -- "$url"
+if command -v curl >/dev/null 2>&1; then curl -q -fsSL --retry 3%[6]s -o "$tmp" -- "$url"
+elif [ -n %[7]s ]; then echo "netrc_file needs curl on the host; add a package step for it first" >&2; exit 1
+elif command -v wget >/dev/null 2>&1; then
+  noconfig=; if wget --no-config --version >/dev/null 2>&1; then noconfig=--no-config; fi
+  wget $noconfig -q -O "$tmp" -- "$url"
 else echo "neither curl nor wget is installed; add a package step for one first" >&2; exit 1; fi
 got=$(sha256sum -- "$tmp" | cut -d' ' -f1)
 if [ "$got" != "$want" ]; then echo "checksum mismatch for $url: got $got, want $want" >&2; exit 1; fi
@@ -101,8 +132,8 @@ chmod %[4]s "$tmp"
 trap - EXIT
 `+file.SyncDir+`
 if command -v restorecon >/dev/null 2>&1; then restorecon -- "$p" 2>/dev/null || true; fi`,
-		ssh.Quote(d.Dest), ssh.Quote(d.URL), d.SHA256, mode, file.Ownership(d.Owner, d.Group))
-	res, err := r.Run(ctx, modules.GuardWrite(script, modules.Write{Owner: d.Owner, Group: d.Group}, modules.Parent(d.Dest)), nil)
+		ssh.Quote(d.Dest), ssh.Quote(d.URL), d.SHA256, mode, file.Ownership(d.Owner, d.Group), netrc, ssh.Quote(d.NetrcFile))
+	res, err := r.Run(ctx, modules.GuardWrite(script, modules.Write{Owner: d.Owner, Group: d.Group, Path: d.Dest}, routes...), nil)
 	return check(res, err)
 }
 
@@ -127,7 +158,7 @@ func (a Archive) Validate() error {
 
 // ReadArchive reports whether the archive's creates path exists.
 func ReadArchive(ctx context.Context, r modules.Runner, a Archive) (bool, error) {
-	res, err := r.Run(ctx, modules.Guard("test -e "+ssh.Quote(a.Creates), modules.Follow(a.Creates)), nil)
+	res, err := r.Run(ctx, modules.Guard(modules.Settled+"route_settled "+ssh.Quote(a.Creates)+" && test -e "+ssh.Quote(a.Creates), modules.Follow(a.Creates)), nil)
 	if err != nil {
 		return false, err
 	}
@@ -136,16 +167,19 @@ func ReadArchive(ctx context.Context, r modules.Runner, a Archive) (bool, error)
 
 // ApplyArchive unpacks the archive: zip files with unzip, anything else with
 // tar, which detects the compression itself. Everything lands in dest, owned
-// by whoever unpacks it, and dest keeps its own mode and owner.
+// by whoever unpacks it, and dest keeps its own mode and owner. Whoever owns
+// dest unpacks it: tar and unzip go through the links they find there, so
+// root unpacking into someone's directory could be led out of it.
 func ApplyArchive(ctx context.Context, r modules.Runner, a Archive) error {
 	if err := a.Validate(); err != nil {
 		return err
 	}
-	script := fmt.Sprintf(`set -e
+	script := modules.Settled + fmt.Sprintf(`set -e
 src=%[1]s
 dest=%[2]s
 test -f "$src" || { echo "$src does not exist" >&2; exit 1; }
-mkdir -p -- "$dest"
+test -r "$src" || { echo "$src can't be read by $(id -un), who owns $dest and so unpacks into it" >&2; exit 1; }
+route_mkdir "$dest"
 case "$src" in
 *.zip) command -v unzip >/dev/null 2>&1 || { echo "unzip is not installed; add a package step for it first" >&2; exit 1; }
   names=$(unzip -Z1 "$src") ;;
@@ -160,7 +194,7 @@ case "$src" in
 esac
 test -e %[3]s || { echo "unpacked $src, but it did not create %[3]s" >&2; exit 1; }`,
 		ssh.Quote(a.Src), ssh.Quote(a.Dest), ssh.Quote(a.Creates))
-	res, err := r.Run(ctx, modules.Guard(script, modules.Follow(a.Src), modules.Follow(a.Dest), modules.Follow(a.Creates)), nil)
+	res, err := r.Run(ctx, modules.Guard(script, modules.Whole(a.Dest), modules.Follow(a.Src), modules.Follow(a.Creates)), nil)
 	return check(res, err)
 }
 
@@ -178,6 +212,13 @@ func (g Git) Validate() error {
 	}
 	if !ok || strings.ContainsAny(g.Repo, " \t\r\n") {
 		return fmt.Errorf("repo %q must be an https, ssh or git@ URL without spaces", g.Repo)
+	}
+	if err := noUserinfo("repo", g.Repo); err != nil {
+		return err
+	}
+	// Nothing vouches for what plain http sends but the commit's own hash.
+	if strings.HasPrefix(g.Repo, "http://") && !commitHex.MatchString(g.Ref) {
+		return fmt.Errorf("repo %q is plain http, where anyone on the way can change what a branch or tag holds; use https, or set ref to a full commit", g.Repo)
 	}
 	if err := absolute("dest", g.Dest); err != nil {
 		return err

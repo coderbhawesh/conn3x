@@ -292,12 +292,13 @@ func (k editKind) apply(ctx context.Context, req providers.ApplyResourceChangeRe
 					return cty.ObjectVal(vals), nil
 				}
 			}
-			target, err := editTarget(ctx, h, planned.GetAttr("path").AsString())
+			path := planned.GetAttr("path").AsString()
+			target, err := editTarget(ctx, h, path)
 			if err != nil {
 				return cty.NilVal, err
 			}
 			create := planned.GetAttr("create")
-			if err := editFile(ctx, h, target, known(create) && create.True(), k.edit(planned)); err != nil {
+			if err := editFile(ctx, h, target, path, known(create) && create.True(), k.edit(planned)); err != nil {
 				return cty.NilVal, err
 			}
 			return cty.ObjectVal(vals), nil
@@ -310,11 +311,12 @@ func (k editKind) apply(ctx context.Context, req providers.ApplyResourceChangeRe
 					return nil
 				}
 			}
-			target, err := editTarget(ctx, h, prior.GetAttr("path").AsString())
+			path := prior.GetAttr("path").AsString()
+			target, err := editTarget(ctx, h, path)
 			if err != nil {
 				return err
 			}
-			return editFile(ctx, h, target, false, k.remove(prior))
+			return editFile(ctx, h, target, path, false, k.remove(prior))
 		})
 }
 
@@ -326,8 +328,11 @@ func (k editKind) apply(ctx context.Context, req providers.ApplyResourceChangeRe
 func editTarget(ctx context.Context, h *hostConn, path string) (string, error) {
 	q := ssh.Quote(path)
 	// Run as a user, the answer only stands if that user can write there:
-	// the edit that follows acts on the answer, on its own route.
-	res, err := h.Run(ctx, modules.Guard(`r=$(readlink -f -- `+q+` 2>/dev/null) || { ! test -L `+q+`; exit; }
+	// the edit that follows acts on the answer, on its own route. Run as
+	// root, a path missing where anyone can create it is its own answer:
+	// a link that turns up there later isn't one to follow.
+	res, err := h.Run(ctx, modules.Guard(modules.Settled+`route_settled `+q+` || exit 0
+r=$(readlink -f -- `+q+` 2>/dev/null) || { ! test -L `+q+`; exit; }
 if [ -n "$CONN3X_ROUTE_USER" ] && [ -n "$r" ]; then
   if [ -e "$r" ]; then test -w "$r"; else test -w "$(dirname -- "$r")"; fi || {
     if [ -L `+q+` ]; then echo `+q+`" leads to $r, which $CONN3X_ROUTE_USER can't write" >&2
@@ -355,9 +360,18 @@ printf '%s\n' "$r"`, modules.Follow(path)), nil)
 // editFile reads a file, applies fn and writes it back only if it changed,
 // keeping its mode and ownership. Edits to one file on a host take turns,
 // so one doesn't write over another it read the file before.
-func editFile(ctx context.Context, h *hostConn, path string, create bool, fn func(string) (string, error)) error {
+//
+// via is the path as the step gives it, which editTarget turned into path.
+// Where someone else owns the way to via, editTarget's answer came from a
+// process of theirs, which they can make say anything. So the edit goes the
+// same way: as them, whatever file the answer names.
+func editFile(ctx context.Context, h *hostConn, path, via string, create bool, fn func(string) (string, error)) error {
 	defer lockHost(h, "edit\x00"+path)()
-	actual, err := file.Read(ctx, h, path)
+	var routes []modules.Route
+	if via != path {
+		routes = append(routes, modules.Follow(via))
+	}
+	actual, err := file.Read(ctx, h, path, routes...)
 	if err != nil {
 		return err
 	}
@@ -374,5 +388,5 @@ func editFile(ctx context.Context, h *hostConn, path string, create bool, fn fun
 	if actual.Exists && edited == actual.Content {
 		return nil
 	}
-	return file.Apply(ctx, h, file.Desired{Path: path, Content: edited, Mode: actual.Mode, Owner: actual.Owner, Group: actual.Group})
+	return file.Apply(ctx, h, file.Desired{Path: path, Content: edited, Mode: actual.Mode, Owner: actual.Owner, Group: actual.Group}, routes...)
 }

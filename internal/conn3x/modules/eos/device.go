@@ -58,16 +58,42 @@ func CheckConfirmAfter(d time.Duration) error {
 	return nil
 }
 
-// secretWord matches what follows a secret-bearing keyword on a CLI line,
-// such as "secret sha512 $6$..." or "secret hunter2": the hash or the
-// password, and its encryption type when there is one.
-var secretWord = regexp.MustCompile(`(?m)(^|\s)(secret|password|key)( (?:sha512|[0-9]))? \S+`)
+// secretWord matches a secret-bearing keyword on a CLI line and the rest of
+// the line: "secret sha512 $6$...", "neighbor 10.0.0.1 password 7 ...",
+// "ntp authentication-key 1 sha1 7 ...", "key-string 7 ...",
+// "snmp-server community ...", and the digests after auth and priv in
+// "snmp-server user ... v3 auth sha ... priv aes ...".
+var secretWord = regexp.MustCompile(`(?mi)(^|\s)([\w-]*(?:secret|password|passphrase|key(?:-string)?)|snmp-server community|auth|priv)[ \t]+(\S.*)$`)
 
-// Mask hides passwords and their hashes in CLI text before it's logged or
-// put in an error: a session diff prints a user's secret hash, and an
-// echoed script line the password itself.
+// Mask hides passwords, keys and their hashes in CLI text before it's
+// logged or put in an error. It hides everything after the keyword, since
+// what follows differs by command. A public key stays readable.
 func Mask(text string) string {
-	return secretWord.ReplaceAllString(text, "$1$2 <hidden>")
+	return secretWord.ReplaceAllStringFunc(text, func(m string) string {
+		sub := secretWord.FindStringSubmatch(m)
+		if strings.EqualFold(sub[2], "ssh-key") {
+			return m
+		}
+		return sub[1] + sub[2] + " <hidden>"
+	})
+}
+
+// scrub is Mask for what the switch says about sent, the commands it was
+// given: besides masking by keyword, it hides every word of a secret in
+// sent, wherever the switch quotes one back.
+func scrub(text, sent string) string {
+	text = Mask(text)
+	for _, m := range secretWord.FindAllStringSubmatch(sent, -1) {
+		if strings.EqualFold(m[2], "ssh-key") {
+			continue
+		}
+		for _, word := range strings.Fields(m[3]) {
+			if len(word) > 2 { // not an encryption type such as 7
+				text = strings.ReplaceAll(text, word, "<hidden>")
+			}
+		}
+	}
+	return text
 }
 
 // cliError matches how the EOS CLI explains a command it refused: a line
@@ -101,9 +127,9 @@ func run(ctx context.Context, d Device, cmd string, stdin []byte) (string, error
 		return out, ErrNotPrivileged
 	}
 	if msg == "" {
-		msg = Mask(fmt.Sprintf("exit status %d: %s", res.ExitCode, strings.TrimSpace(string(res.Stdout)+string(res.Stderr))))
+		msg = fmt.Sprintf("exit status %d: %s", res.ExitCode, strings.TrimSpace(string(res.Stdout)+string(res.Stderr)))
 	}
-	return out, fmt.Errorf("the switch refused %s: %s", describe(cmd), msg)
+	return out, fmt.Errorf("the switch refused %s: %s", describe(cmd), scrub(msg, cmd+"\n"+string(stdin)))
 }
 
 func describe(cmd string) string {
@@ -195,13 +221,15 @@ type Session struct {
 	Name    string
 	started bool     // the switch has the session: lines went in
 	base    [32]byte // running-config when it was read for the first lines
+	lines   []string // every line added, for the log
 }
 
 // sessionsJSON is show configuration sessions | json, as cEOS-lab 4.37.0F
 // prints it.
 type sessionsJSON struct {
 	Sessions map[string]struct {
-		State string `json:"state"`
+		State       string `json:"state"`
+		Description string `json:"description"` // with "detail" only
 	} `json:"sessions"`
 	CommitTimerSessionName string  `json:"commitTimerSessionName"`
 	CommitTimerExpireTime  float64 `json:"commitTimerExpireTime"`
@@ -266,23 +294,38 @@ func (s *Session) Add(ctx context.Context, d Device, cmds []string) error {
 	}
 	// The CLI reads the script from stdin; "end" leaves the session pending.
 	script := "configure session " + s.Name + "\n" + strings.Join(cmds, "\n") + "\nend\n"
+	first := !s.started
 	s.started = true
-	_, err := run(ctx, d, "", []byte(script))
-	return err
+	s.lines = append(s.lines, cmds...)
+	if _, err := run(ctx, d, "", []byte(script)); err != nil {
+		return err
+	}
+	if first {
+		// The mark stillPending looks for.
+		_, err := run(ctx, d, "configure session "+s.Name+" description "+s.Name, nil)
+		return err
+	}
+	// An abort from outside between the check above and the script: the
+	// script then started a new session, which has these lines only.
+	return s.stillPending(ctx, d)
 }
 
 // stillPending fails when the session is gone: another run opening a session
 // on this switch aborts pending ones, and so can someone by hand. Entering a
-// gone session would start a new one, quietly, holding only later lines.
+// gone session starts a new one, quietly, holding only later lines, so the
+// session carries its name as its description from its first lines on: one
+// started again has none.
 func (s *Session) stillPending(ctx context.Context, d Device) error {
 	var st sessionsJSON
-	if err := ShowJSON(ctx, d, "show configuration sessions", &st); err != nil {
+	if err := ShowJSON(ctx, d, "show configuration sessions detail", &st); err != nil {
 		return err
 	}
-	if st.Sessions[s.Name].State == "pending" {
+	switch got := st.Sessions[s.Name]; {
+	case got.State != "pending":
+		s.started = false // nothing left to abort
+	case got.Description == s.Name:
 		return nil
 	}
-	s.started = false // nothing left to abort
 	return SessionGoneError{s.Name}
 }
 
@@ -332,7 +375,7 @@ func (s *Session) aborted(ctx context.Context, d Device, err error) error {
 //     the change back by itself. The wait gives the change time to bite.
 //  4. The running config is copied to startup-config.
 //
-// It returns the session's diff as the switch printed it.
+// It returns the lines the session added, masked, for the log.
 func (s *Session) Commit(ctx context.Context, d Device, reconnect func(context.Context) (Device, error), confirmAfter time.Duration) (string, error) {
 	if !s.started {
 		return "", nil
@@ -348,10 +391,9 @@ func (s *Session) Commit(ctx context.Context, d Device, reconnect func(context.C
 	if configHash(running) != s.base {
 		return "", s.aborted(ctx, d, errors.New("running-config changed while this apply was adding lines to its config session (a change by hand, or another tool or run), and committing the session would undo that change"))
 	}
-	diff, err := Show(ctx, d, "show session-config named "+s.Name+" diffs")
-	if err != nil {
-		return "", s.aborted(ctx, d, err)
-	}
+	// Not the switch's own diff of the session: its context lines are the
+	// config around the change, secrets of other features included.
+	diff := Mask(strings.Join(s.lines, "\n"))
 	if _, err := run(ctx, d, session+" commit timer "+timerText(RevertAfter), nil); err != nil {
 		return diff, s.aborted(ctx, d, err)
 	}

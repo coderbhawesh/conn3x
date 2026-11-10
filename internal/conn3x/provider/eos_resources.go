@@ -5,6 +5,8 @@ package provider
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log"
@@ -115,6 +117,8 @@ type eosKind struct {
 	// guard, when set, refuses a change that would cut Conn3x off from the
 	// switch at address, given the config it's computed from.
 	guard func(v cty.Value, config, address string) error
+	// warn, when set, is what a read has to say about the config, or "".
+	warn func(v cty.Value, config string) string
 }
 
 // eosWant is what a step wants of a switch's config, such as eos.Config.
@@ -146,6 +150,11 @@ func (k eosKind) read(ctx context.Context, req providers.ReadResourceRequest) pr
 		return resp
 	}
 	resp.NewState = withSync(req.PriorState, k.config(req.PriorState).InSync(running))
+	if k.warn != nil {
+		if w := k.warn(req.PriorState, running); w != "" {
+			resp.Diagnostics = resp.Diagnostics.Append(tfdiags.SimpleWarning(fmt.Sprintf("eos_%s on %s: %s", k.name, h.host, w)))
+		}
+	}
 	return resp
 }
 
@@ -206,7 +215,7 @@ func (k eosKind) apply(ctx context.Context, req providers.ApplyResourceChangeReq
 	case removing && st.session == nil && !st.batch:
 		diff, err := eos.Apply(ctx, h.client, eosReconnect(conn), base, cmds, confirmAfter(conn))
 		if diff != "" {
-			log.Printf("[INFO] conn3x: eos_%s on %s: session diff:\n%s", k.name, h.host, eos.Mask(diff))
+			log.Printf("[INFO] conn3x: eos_%s on %s: lines added:\n%s", k.name, h.host, eos.Mask(diff))
 		}
 		if err != nil {
 			return fail(err)
@@ -240,6 +249,10 @@ type staged struct {
 	removals [][]string   // removals in the session: their steps are already forgotten
 	conn     cty.Value    // the ssh block they came with, to commit them again
 	batch    bool         // destroying: removals stage for conn3x_eos_removals
+	// committed: a commit already made lines live in this run. Circuits on
+	// one switch share its session, so the first circuit's commit takes the
+	// lines the others have added so far with it.
+	committed bool
 }
 
 var stagedSessions = struct {
@@ -269,8 +282,12 @@ func (st *staged) abort(ctx context.Context, h *hostConn, err error) error {
 	if abortErr := st.session.Abort(ctx, h.client); abortErr != nil {
 		err = fmt.Errorf("%w; %v", err, abortErr)
 	} else {
-		err = fmt.Errorf("%w. Nothing was changed on %s: the lines earlier steps added in this apply were dropped too", err, h.host)
-		err = st.salvage(ctx, h, st.removals, err)
+		if st.committed {
+			err = fmt.Errorf("%w. The lines steps added since this apply's last commit on %s were dropped too; what that commit made live, lines of this circuit's earlier steps among them, stays", err, h.host)
+		} else {
+			err = fmt.Errorf("%w. Nothing was changed on %s: the lines earlier steps added in this apply were dropped too", err, h.host)
+		}
+		err, _ = st.salvage(ctx, h, st.removals, err)
 	}
 	st.session, st.removals, st.failed = nil, nil, err
 	return err
@@ -279,10 +296,10 @@ func (st *staged) abort(ctx context.Context, h *hostConn, err error) error {
 // salvage commits removed, the removals of a session that went nowhere, in
 // a session of their own: OpenTofu has already forgotten their steps, so
 // the switch must lose those lines too. It returns err, saying what became
-// of them.
-func (st *staged) salvage(ctx context.Context, h *hostConn, removed [][]string, err error) error {
+// of them, and whether the switch still has them.
+func (st *staged) salvage(ctx context.Context, h *hostConn, removed [][]string, err error) (_ error, left bool) {
 	if len(removed) == 0 {
-		return err
+		return err, false
 	}
 	var lines []string
 	for _, cmds := range removed {
@@ -290,7 +307,7 @@ func (st *staged) salvage(ctx context.Context, h *hostConn, removed [][]string, 
 	}
 	if errors.As(err, new(eos.SessionGoneError)) {
 		// Another run has the switch; a session of ours would abort its.
-		return fmt.Errorf("%w. Removals in that session were dropped as well, and Conn3x has already forgotten them, so once the other run is done, remove these by hand: %s", err, strings.Join(lines, " | "))
+		return fmt.Errorf("%w. Removals in that session were dropped as well, and Conn3x has already forgotten them, so once the other run is done, remove these by hand: %s", err, strings.Join(lines, " | ")), true
 	}
 	again := func() error {
 		running, err := eos.RunningConfig(ctx, h.client)
@@ -311,13 +328,16 @@ func (st *staged) salvage(ctx context.Context, h *hostConn, removed [][]string, 
 		return err
 	}
 	if againErr := again(); againErr != nil {
-		return fmt.Errorf("%w. Removals in that session were dropped as well, and committing them on their own failed too (%v). Conn3x has already forgotten them, so remove these by hand: %s", err, againErr, strings.Join(lines, " | "))
+		return fmt.Errorf("%w. Removals in that session were dropped as well, and committing them on their own failed too (%v). Conn3x has already forgotten them, so remove these by hand: %s", err, againErr, strings.Join(lines, " | ")), true
 	}
-	return fmt.Errorf("%w. The removals in that session were committed on their own, so the switch no longer has them: %s", err, strings.Join(lines, " | "))
+	return fmt.Errorf("%w. The removals in that session were committed on their own, so the switch no longer has them: %s", err, strings.Join(lines, " | ")), false
 }
 
 // abortStaged aborts every session still staged, as when a run fails
-// before a switch's commit. The sessions were never live.
+// before a switch's commit. The sessions were never live. What that leaves
+// for someone to do by hand goes to stagedLeft: a session it couldn't
+// abort, and removals the switch still has though their steps are gone
+// from state.
 func abortStaged() {
 	stagedSessions.Lock()
 	defer stagedSessions.Unlock()
@@ -327,16 +347,37 @@ func abortStaged() {
 			log.Printf("[WARN] conn3x: aborting config session %s on %s, which no conn3x_eos_commit made live", st.session.Name, st.h.host)
 			if err := st.session.Abort(ctx, st.h.client); err != nil {
 				log.Printf("[WARN] conn3x: %v", err)
+				stagedLeft = append(stagedLeft, fmt.Errorf("%s: %w", st.h.host, err))
 			} else if len(st.removals) > 0 {
 				// Up to five minutes: a commit, its wait and the confirm.
 				cancel()
 				ctx, cancel = context.WithTimeout(context.Background(), eos.RevertAfter)
-				log.Printf("[WARN] conn3x: %v", st.salvage(ctx, st.h, st.removals, fmt.Errorf("the run stopped before the commit")))
+				err, left := st.salvage(ctx, st.h, st.removals, fmt.Errorf("the run stopped before the commit"))
+				log.Printf("[WARN] conn3x: %v", err)
+				if left {
+					stagedLeft = append(stagedLeft, fmt.Errorf("%s: %w", st.h.host, err))
+				}
 			}
 			cancel()
 		}
 		delete(stagedSessions.m, key)
 	}
+}
+
+// stagedLeft is what abortStaged couldn't clean up. Guarded by
+// stagedSessions.
+var stagedLeft []error
+
+// FinishEOS ends a run for the EOS steps: it aborts what is still staged and
+// returns what that left on a switch, for the command to print. A failed
+// apply doesn't close its providers, so the command calls this as it exits.
+func FinishEOS() error {
+	abortStaged()
+	stagedSessions.Lock()
+	defer stagedSessions.Unlock()
+	err := errors.Join(stagedLeft...)
+	stagedLeft = nil
+	return err
 }
 
 // openProviders counts provider instances not yet closed. The last Close
@@ -553,11 +594,12 @@ func applyEOSCommit(ctx context.Context, req providers.ApplyResourceChangeReques
 	st.session, st.removals = nil, nil // committed or rolling back: either way, gone
 	diff, err := s.Commit(ctx, h.client, eosReconnect(conn), confirmAfter(conn))
 	if diff != "" {
-		log.Printf("[INFO] conn3x: eos commit on %s: session diff:\n%s", h.host, eos.Mask(diff))
+		log.Printf("[INFO] conn3x: eos commit on %s: lines added:\n%s", h.host, eos.Mask(diff))
 	}
 	if errors.As(err, new(eos.NotLiveError)) {
-		err = st.salvage(ctx, h, removed, err)
+		err, _ = st.salvage(ctx, h, removed, err)
 	}
+	st.committed = st.committed || err == nil
 	if err != nil {
 		resp.Diagnostics = resp.Diagnostics.Append(fmt.Errorf("eos commit: %w. The steps are recorded as applied, so the next refresh finds them out of sync and the next apply makes them again", err))
 	}
@@ -612,11 +654,12 @@ func applyEOSRemovals(ctx context.Context, req providers.ApplyResourceChangeRequ
 	st.session, st.removals = nil, nil
 	diff, err := s.Commit(ctx, h.client, eosReconnect(conn), confirmAfter(conn))
 	if diff != "" {
-		log.Printf("[INFO] conn3x: eos removals on %s: session diff:\n%s", h.host, eos.Mask(diff))
+		log.Printf("[INFO] conn3x: eos removals on %s: lines added:\n%s", h.host, eos.Mask(diff))
 	}
 	switch {
 	case errors.As(err, new(eos.NotLiveError)):
-		resp.Diagnostics = resp.Diagnostics.Append(fmt.Errorf("eos removals: %w", st.salvage(ctx, h, removed, err)))
+		err, _ = st.salvage(ctx, h, removed, err)
+		resp.Diagnostics = resp.Diagnostics.Append(fmt.Errorf("eos removals: %w", err))
 	case err != nil:
 		var lines []string
 		for _, cmds := range removed {
@@ -699,20 +742,65 @@ func eosUserFrom(v cty.Value) eos.User {
 		n, _ := p.AsBigFloat().Int64()
 		u.Privilege = int(n)
 	}
+	if n := v.GetAttr("nopassword"); known(n) {
+		b := n.True()
+		u.NoPassword = &b
+	}
 	// password_hmac is unknown while a new password is planned.
-	u.WantSecret = !v.GetAttr("password_hmac").IsNull()
+	stored := v.GetAttr("password_hmac")
+	u.WantSecret = !stored.IsNull()
+	// Without the key that made password_hmac, as on a machine that only
+	// refreshes or destroys, a read can't tell which secret the switch
+	// holds, only that it has one. A plan with password_wo fails on the key.
+	if key, err := hmacKey(false); err == nil && known(stored) && checkHMACKey(stored.AsString(), key) == nil {
+		id := eosUserID(v)
+		u.SecretIs = func(hash string) bool {
+			return hmac.Equal([]byte(eosSecretHMAC(key, id, hash)), []byte(stored.AsString()))
+		}
+	}
 	return u
+}
+
+func eosUserID(v cty.Value) string {
+	return passwordID("eos_user", stringOr(v.GetAttr("ssh").GetAttr("host"), ""), stringOr(v.GetAttr("name"), ""))
+}
+
+// eosSecret is the hash eos_user sends for password, "$6$<salt>$<hash>". Its
+// salt comes from the key and the stretched password, so the same password
+// always gives the same hash, and a plan can say what a read should find.
+func eosSecret(key []byte, id, password string) string {
+	salt := hmac.New(sha256.New, key)
+	salt.Write([]byte("conn3x eos salt\x00" + passwordHMAC(key, id, password)))
+	return eos.SecretHash(password, eos.CryptSalt(salt.Sum(nil)))
+}
+
+// eosSecretHMAC is what password_hmac records: an HMAC of the hash the
+// switch should hold. State keeps neither the password nor the hash, and a
+// guess at the password still costs the Argon2id stretch behind the salt.
+func eosSecretHMAC(key []byte, id, hash string) string {
+	return passwordTag + contentHMAC(key, id, "eos secret:"+hash)
+}
+
+func eosPasswordHMAC(key []byte, id, password string) string {
+	return eosSecretHMAC(key, id, eosSecret(key, id, password))
 }
 
 var eosUserKind = eosKind{
 	name:     "user",
 	keys:     []string{"name"},
-	settings: []string{"privilege", "role", "ssh_key", "password_hmac"},
+	settings: []string{"privilege", "role", "ssh_key", "nopassword", "password_hmac"},
 	deletes:  true,
 	config:   func(v cty.Value) eosWant { return eosUserFrom(v) },
 	remove:   func(v cty.Value, running string) []string { return eosUserFrom(v).RemoveCommands(running) },
 	guard: func(v cty.Value, _, _ string) error {
 		return eosUserFrom(v).Guard(stringOr(v.GetAttr("ssh").GetAttr("user"), ""))
+	},
+	warn: func(v cty.Value, config string) string {
+		u := eosUserFrom(v)
+		if !u.OpenLogin(config) {
+			return ""
+		}
+		return fmt.Sprintf("account %s has nopassword, so it logs in with an empty password wherever the switch takes password logins, the console included. Conn3x up to v0.11.0 made key-only accounts this way. Set nopassword = false to give it a secret no password matches, password_wo to give it a password, or nopassword = true to keep it and stop this warning.", u.Name)
 	},
 }
 
@@ -725,8 +813,9 @@ func eosUserSchema() providers.Schema {
 			"name":          {Type: cty.String, Required: true, Description: "The user name."},
 			"privilege":     {Type: cty.Number, Optional: true, Description: "0 to 15. Conn3x's own login needs 15."},
 			"role":          {Type: cty.String, Optional: true, Description: "A role, such as network-admin or network-operator."},
-			"password_wo":   {Type: cty.String, Optional: true, Sensitive: true, WriteOnly: true, Description: "Write-only: the password, sent to the switch and never kept in state. The switch stores it as a salted hash, so Conn3x can only tell that a password is set; a new value plans a change through password_hmac. Unset leaves the account's password alone, and a new account gets none (nopassword), for SSH keys only."},
-			"password_hmac": {Type: cty.String, Computed: true, Description: "An HMAC of password_wo, keyed outside state, so a new password plans a change."},
+			"password_wo":   {Type: cty.String, Optional: true, Sensitive: true, WriteOnly: true, Description: "Write-only: the password, never kept in state. Conn3x hashes it here and sends the switch the salted hash it would store anyway, so the password itself never reaches the CLI; a new value plans a change through password_hmac. Unset leaves the account's password alone, and a new account gets a secret no password matches (secret *), for SSH keys only."},
+			"nopassword":    {Type: cty.Bool, Optional: true, Description: "true lets the account log in with no password at all (nopassword), wherever the switch takes password logins. false makes sure it can't: an account that has nopassword gets a secret no password matches. Unset leaves an existing account as it is. Can't be true with password_wo."},
+			"password_hmac": {Type: cty.String, Computed: true, Description: "An HMAC of the salted hash the switch should hold for password_wo, keyed outside state. A new password plans a change, and a refresh finds an account whose secret is another one out of sync."},
 			"ssh_key":       {Type: cty.String, Optional: true, Description: "One public key line, such as \"ssh-ed25519 AAAA... alice@laptop\". \"\" removes the account's key."},
 			"on_remove":     {Type: cty.String, Optional: true, Computed: true, Description: "\"delete\" (default) removes the account when the step goes, as with every step that grants access; \"forget\" leaves it."},
 			"in_sync":       {Type: cty.Bool, Computed: true, Description: "Whether the account matched at the last refresh."},
@@ -742,7 +831,7 @@ func validateEOSUser(cfg cty.Value) tfdiags.Diagnostics {
 	}
 	diags = diags.Append(validateOnRemove(cfg))
 	u := eosUserFrom(cfg)
-	u.Secret = stringOr(cfg.GetAttr("password_wo"), "")
+	u.WantSecret = !cfg.GetAttr("password_wo").IsNull()
 	if err := u.Validate(); err != nil {
 		diags = diags.Append(attrError("name", err.Error()))
 	}
@@ -750,11 +839,13 @@ func validateEOSUser(cfg cty.Value) tfdiags.Diagnostics {
 }
 
 func planEOSUser(req providers.PlanResourceChangeRequest) providers.PlanResourceChangeResponse {
-	return planWithPassword(deleteByDefault(req), "eos_user", eosUserKind.settings)
+	return planPasswordAs(deleteByDefault(req), "eos_user", eosUserKind.settings, planSyncedFold, eosPasswordHMAC)
 }
 
-// applyEOSUser hands the step's password, which only the config holds, to
-// the commands, and says whether it changed since the last apply.
+// applyEOSUser hashes the step's password, which only the config holds, for
+// the commands. They send the hash whenever the switch holds another one,
+// whatever state says: an account that was already there, or a password
+// whose session never committed, has the old secret.
 func applyEOSUser(ctx context.Context, req providers.ApplyResourceChangeRequest) providers.ApplyResourceChangeResponse {
 	if req.PlannedState.IsNull() && !req.PriorState.IsNull() && req.PriorState.GetAttr("on_remove").AsString() == onRemoveDelete {
 		if name := req.PriorState.GetAttr("name").AsString(); name == stringOr(req.PriorState.GetAttr("ssh").GetAttr("user"), "") {
@@ -763,26 +854,39 @@ func applyEOSUser(ctx context.Context, req providers.ApplyResourceChangeRequest)
 			return resp
 		}
 	}
-	var secret string
-	if !req.Config.IsNull() {
-		secret = stringOr(req.Config.GetAttr("password_wo"), "")
-	}
-	rotate := !req.PlannedState.IsNull() && !req.PriorState.IsNull() && !req.PriorState.GetAttr("password_hmac").RawEquals(req.PlannedState.GetAttr("password_hmac"))
 	k := eosUserKind
-	k.config = func(v cty.Value) eosWant {
-		u := eosUserFrom(v)
-		u.Secret, u.Rotate = secret, rotate
-		return u
-	}
-	if !req.PlannedState.IsNull() && eosUserFrom(req.PlannedState).WantSecret && secret == "" {
+	var mac string
+	if !req.PlannedState.IsNull() && eosUserFrom(req.PlannedState).WantSecret {
 		var resp providers.ApplyResourceChangeResponse
-		resp.Diagnostics = resp.Diagnostics.Append(errors.New("eos_user: password_wo didn't reach the apply; it's write-only, so set it in the step's config"))
-		return resp
+		password := ""
+		if !req.Config.IsNull() {
+			password = stringOr(req.Config.GetAttr("password_wo"), "")
+		}
+		if password == "" {
+			resp.Diagnostics = resp.Diagnostics.Append(errors.New("eos_user: password_wo didn't reach the apply; it's write-only, so set it in the step's config"))
+			return resp
+		}
+		key, err := hmacKey(true)
+		if err != nil {
+			resp.Diagnostics = resp.Diagnostics.Append(attrError("password_wo", err.Error()))
+			return resp
+		}
+		id := eosUserID(req.PlannedState)
+		hash := eosSecret(key, id, password)
+		mac = eosSecretHMAC(key, id, hash)
+		k.config = func(v cty.Value) eosWant {
+			u := eosUserFrom(v)
+			u.Secret, u.SecretIs = hash, func(h string) bool { return h == hash }
+			return u
+		}
 	}
 	resp := k.apply(ctx, req)
 	if !resp.NewState.IsNull() {
 		vals := resp.NewState.AsValueMap()
 		vals["password_wo"] = cty.NullVal(cty.String)
+		if mac != "" {
+			vals["password_hmac"] = cty.StringVal(mac) // unknown in a plan that didn't know the password
+		}
 		resp.NewState = cty.ObjectVal(vals)
 	}
 	return resp

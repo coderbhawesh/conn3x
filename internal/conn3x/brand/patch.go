@@ -22,6 +22,49 @@ var patches = map[string][][2]string{
 		{`"tofu", version,`, `"tofu", version, "conn3x", conn3xversion.Version,`},
 		{"import (", "import (\n\tconn3xversion \"github.com/opentofu/opentofu/internal/conn3x/version\""},
 	},
+	// A plan, show or state show prints a multi-line string as it is, line
+	// by line. Hosts write many of them, a file's content for one, so
+	// control characters in them are written out as escapes. A single-line
+	// string is already printed quoted.
+	"internal/command/jsonformat/computed/renderers/string.go": {
+		{"String:      strings.TrimSpace(str),", "String:      termsafe.Escape(strings.TrimSpace(str)),"},
+		{"func (e evaluatedString) RenderSimple() string {", `// conn3xLines is the string as the lines of a line-by-line diff, where a
+// single-line string is printed unquoted beside a multi-line one.
+func (e evaluatedString) conn3xLines() []string {
+	if e.IsNull {
+		return []string{e.String}
+	}
+	return strings.Split(termsafe.Escape(e.String), "\n")
+}
+
+func (e evaluatedString) RenderSimple() string {`},
+		{"import (", "import (\n\t\"github.com/opentofu/opentofu/internal/conn3x/termsafe\""},
+	},
+	// An error or warning often quotes a host: what a failed command
+	// printed, or a refused read. With color on, upstream swaps the C0
+	// control characters in it for pictures; without, it prints them as
+	// they are. Both now write every control character out as an escape.
+	"internal/command/format/diagnostic.go": {
+		{"func DiagnosticFromJSON(diag *jsonentities.Diagnostic, color *colorstring.Colorize, width int) string {", `// conn3xSafe is diag with the control characters in its text escaped.
+func conn3xSafe(diag *jsonentities.Diagnostic) *jsonentities.Diagnostic {
+	if diag == nil {
+		return nil
+	}
+	safe := *diag
+	safe.Summary, safe.Detail = termsafe.Escape(diag.Summary), termsafe.Escape(diag.Detail)
+	return &safe
+}
+
+func DiagnosticFromJSON(diag *jsonentities.Diagnostic, color *colorstring.Colorize, width int) string {
+	diag = conn3xSafe(diag)`},
+		{"func DiagnosticPlainFromJSON(diag *jsonentities.Diagnostic, width int) string {", "func DiagnosticPlainFromJSON(diag *jsonentities.Diagnostic, width int) string {\n\tdiag = conn3xSafe(diag)"},
+		{"diag.Description().Summary)", "termsafe.Escape(diag.Description().Summary))"},
+		{"import (", "import (\n\t\"github.com/opentofu/opentofu/internal/conn3x/termsafe\""},
+	},
+	"internal/command/jsonformat/computed/renderers/primitive.go": {
+		{`beforeLines := strings.Split(beforeString.String, "\n")`, "beforeLines := beforeString.conn3xLines()"},
+		{`afterLines := strings.Split(afterString.String, "\n")`, "afterLines := afterString.conn3xLines()"},
+	},
 }
 
 // patch applies patches, starting from each file's branded copy when there

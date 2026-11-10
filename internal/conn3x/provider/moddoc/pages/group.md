@@ -49,4 +49,4 @@ When you delete a `group` step, `on_remove` decides what happens on the host. Th
 
 ## From Ansible
 
-`conn3x convert ansible` turns `group` tasks into `group` steps, carrying over `gid` and `system`. A task with `state: absent` stays a TODO.
+`conn3x convert ansible` turns `group` tasks into `group` steps, carrying over `gid` and `system`. A task with `state: absent` stays a TODO, as does a `gid` that isn't a whole number.

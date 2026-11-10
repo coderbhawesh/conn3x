@@ -84,7 +84,7 @@ func winWaitForModule(in *input) ([]step, string) {
 	var attrs []attr
 	attrs = in.optional(attrs, "path", "path")
 	if in.has("port") {
-		attrs = append(attrs, attr{key: "port", raw: in.str("port")})
+		attrs = append(attrs, in.number("port"))
 	}
 	if in.has("timeout") {
 		secs, err := strconv.Atoi(in.str("timeout"))
@@ -122,7 +122,7 @@ func winCopyModule(in *input) ([]step, string) {
 		attrs = append(attrs, s("content", in.str("content")))
 	case in.has("src"):
 		if p := in.local("files", in.str("src")); p != "" {
-			attrs = append(attrs, attr{key: "content", raw: fmt.Sprintf(`file("${path.module}/%s")`, p)})
+			attrs = append(attrs, attr{key: "content", raw: "file(" + moduleFile(p) + ")"})
 		}
 	default:
 		return nil, "has neither content nor src"
@@ -372,7 +372,9 @@ func winFirewallRuleModule(in *input) ([]step, string) {
 	if in.has("action") {
 		attrs = append(attrs, s("action", strings.ToLower(in.str("action"))))
 	}
-	if p := strings.ToLower(in.str("protocol")); p != "" && p != "any" {
+	// "any" is written out when the task says it: a windows_firewall_rule
+	// only lets everything in when asked to in so many words.
+	if p := strings.ToLower(in.str("protocol")); p != "" {
 		attrs = append(attrs, s("protocol", p))
 	}
 	if ports := in.list("localport"); len(ports) > 0 && !strings.EqualFold(ports[0], "any") {
@@ -392,6 +394,16 @@ func winFirewallRuleModule(in *input) ([]step, string) {
 		attrs = append(attrs, attr{key: "enabled", val: cty.BoolVal(in.bool("enabled", true))})
 	}
 	attrs = in.optional(attrs, "description", "description")
+	open := true
+	for _, a := range attrs {
+		switch {
+		case a.key == "direction", a.key == "action" && a.val.AsString() != "allow", a.key == "protocol", a.key == "local_ports", a.key == "remote_addresses":
+			open = false
+		}
+	}
+	if open {
+		return nil, "allows all inbound traffic from anywhere without saying so; a windows_firewall_rule needs protocol and local_ports, or remote_addresses, or protocol = \"any\" to mean it"
+	}
 	return one("windows_firewall_rule", attrs, "Conn3x finds this rule by its ID, which is name; Ansible found it by its display name. If the rule Ansible made has another ID, delete it, or the two overlap.")
 }
 

@@ -12,6 +12,7 @@ circuit "famincl" {
     become           = var.ssh_become
   }
 
+  # TODO(convert): Set mode if this file isn't meant to be 0644. The task set none, so Ansible left a file that was already there as it was; this step sets 0644.
   step "debian_setup" {
     when = local.os_family[each.key] == "debian"
     file {
@@ -20,6 +21,7 @@ circuit "famincl" {
     }
   }
 
+  # TODO(convert): Set mode if this file isn't meant to be 0644. The task set none, so Ansible left a file that was already there as it was; this step sets 0644.
   step "red_hat_setup" {
     when = local.os_family[each.key] == "redhat"
     file {
@@ -28,6 +30,7 @@ circuit "famincl" {
     }
   }
 
+  # TODO(convert): Set mode if this file isn't meant to be 0644. The task set none, so Ansible left a file that was already there as it was; this step sets 0644.
   step "debian_extra" {
     when = local.os_family[each.key] == "debian"
     file {
