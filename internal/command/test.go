@@ -699,6 +699,10 @@ func (runner *TestFileRunner) ExecuteTestRun(ctx context.Context, run *moduletes
 	}
 
 	applyCtx.TestContext(config, updated, plan, variables).EvaluateAgainstState(run)
+	// CONN3X: idempotent = true plans again and fails on a change (see conn3x_idempotent.go).
+	if run.Config.Idempotent {
+		runner.checkIdempotent(ctx, config, updated, run, file)
+	}
 	return updated, true
 }
 
