@@ -570,7 +570,7 @@ func (c *Client) exec(ctx context.Context, cmd string, stdin []byte) (Result, er
 		return Result{}, ctx.Err()
 	case err := <-done:
 		if over.Load() {
-			return Result{}, fmt.Errorf("ssh %s: the command printed more than %d MiB, the most conn3x reads from one command on a host", c.addr, MaxOutput>>20)
+			return Result{}, c.overOutput()
 		}
 		res := Result{Stdout: stdout.buf.Bytes(), Stderr: stderr.buf.Bytes()}
 		var exitErr *gossh.ExitError
@@ -625,7 +625,9 @@ func (c *Client) Start(ctx context.Context, cmd string) (*Process, error) {
 	}
 	p := &Process{addr: c.addr, session: session, done: sync.OnceFunc(func() { c.done(session) })}
 	session.Stderr = &p.stderr
-	if p.stdin, err = session.StdinPipe(); err == nil {
+	var stdin io.WriteCloser
+	if stdin, err = session.StdinPipe(); err == nil {
+		p.stdin = &closeOnce{WriteCloser: stdin}
 		p.stdout, err = session.StdoutPipe()
 	}
 	if err == nil {
@@ -645,6 +647,20 @@ func (p *Process) Write(b []byte) (int, error) { return p.stdin.Write(b) }
 // far. Nothing signals new output; a caller waiting for some, such as a
 // sudo prompt, has to call it again.
 func (p *Process) Stderr() []byte { return p.stderr.Bytes() }
+
+// closeOnce closes its writer one time. Whoever writes a command's input
+// closes it when done, and so does Process.Close: two closes at once race
+// inside the SSH channel.
+type closeOnce struct {
+	io.WriteCloser
+	once sync.Once
+	err  error
+}
+
+func (c *closeOnce) Close() error {
+	c.once.Do(func() { c.err = c.WriteCloser.Close() })
+	return c.err
+}
 
 // Wait waits for the command to exit. A non-zero exit is an error.
 func (p *Process) Wait() error {
@@ -669,6 +685,11 @@ func (p *Process) Close() error {
 // and of its standard error. It leaves room for the largest file the agent
 // returns, 255 MiB, in base64.
 var MaxOutput = 384 << 20
+
+// overOutput is the error for a command killed at MaxOutput.
+func (c *Client) overOutput() error {
+	return fmt.Errorf("ssh %s: the command printed more than %d MiB, the most conn3x reads from one command on a host", c.addr, MaxOutput>>20)
+}
 
 // capped is a buffer that calls stop, once, when a write would take it
 // past MaxOutput, and keeps nothing more.
